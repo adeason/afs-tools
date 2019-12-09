@@ -1,0 +1,602 @@
+#!/usr/bin/python3
+
+import argparse
+import ctypes as c
+import ipaddress
+import sys
+import uuid
+import yaml
+
+### Exceptions
+
+class UbikFormatError(Exception): pass
+class VL4FormatError(Exception): pass
+class InternalError(Exception): pass
+
+### Low-level structs, etc.
+
+class BigEndianStruct(c.BigEndianStructure):
+    _pack_ = 1
+
+    def to_bytes(self):
+        return bytes(self)
+
+    @classmethod
+    def from_bytes(cls, buf):
+        return cls.from_buffer_copy(buf)
+
+    @classmethod
+    def from_file(cls, fh, offset):
+        fh.seek(offset)
+        buf = fh.read(c.sizeof(cls))
+        return cls.from_bytes(buf)
+
+    def __str__(self):
+        indent = "  "
+
+        fields_arr = []
+        for field in self._fields_:
+            field_str = str(getattr(self, field[0]))
+            field_str = field_str.replace("\n", "\n"+indent)
+
+            fields_arr.append("\n%s%s: %s" % (indent, field[0], field_str))
+
+        return "{%s\n}" % (", ".join(fields_arr))
+
+def assert_size(cstruct, size):
+    if c.sizeof(cstruct) != size:
+        raise AssertionError("sizeof(%s)is %d, not %d" % (cstruct.__name__,
+                             c.sizeof(cstruct), size))
+    #print("sizeof(%s) == %d" % (cstruct.__name__, size))
+
+# Ubik structs
+
+class ubik_version(BigEndianStruct):
+    _fields_ = [("epoch",   c.c_uint32),
+                ("counter", c.c_uint32)]
+
+class ubik_hdr(BigEndianStruct):
+    UBIK_MAGIC = 0x354545
+    HDRSIZE = 64
+
+    _fields_ = [("magic",   c.c_uint32),
+                ("pad1",    c.c_uint16),
+                ("size",    c.c_uint16),
+                ("version", ubik_version)]
+
+# VLDB v4 structs
+
+VL4_MAXSERVERID = 254
+VL4_BADSERVERID = 255
+
+VL4_HASHSIZE = 8191
+VL4_MAXTYPES = 3
+VL4_MAXNAMELEN = 65
+VL4_NMAXNSERVERS = 13
+
+VL4_MHSRV_PERBLK = 64
+VL4_MAXIPADDRS_PERMH = 15
+VL4_MAX_ADDREXTBLKS = 4
+VL4_ADDREXTBLK_SIZE = 8192
+
+# vl4_nvlentry flags
+VL4_FREE =              0x1
+VL4_CONTBLOCK =         0x8
+VL4_VLOP_MOVE =        0x10
+VL4_VLOP_RELEASE =     0x20
+VL4_VLOP_BACKUP =      0x40
+VL4_VLOP_DELETE =      0x90
+VL4_VLOP_DUMP =       0x100
+
+# vl4_nvlentry.serverFlags flags
+VL4_VLSF_NEWREPSITE = 0x1
+VL4_VLSF_RWVOL =      0x4
+VL4_VLSF_DONTUSE =   0x20
+
+class vl4_vital_vlheader(BigEndianStruct):
+    _fields_ = [("vldbversion", c.c_int32),
+                ("headersize",  c.c_int32),
+                ("freePtr",     c.c_int32),
+                ("eofPtr",      c.c_int32),
+                ("allocs",      c.c_int32),
+                ("frees",       c.c_int32),
+                ("MaxVolumeId", c.c_uint32),
+                ("totalEntries", c.c_int32 * VL4_MAXTYPES)]
+
+class vl4_vlheader(BigEndianStruct):
+    _anonymous_ = ("vital_header",)
+    _fields_ = [("vital_header", vl4_vital_vlheader),
+                ("IpMappedAddr", c.c_uint32 * (VL4_MAXSERVERID + 1)),
+                ("VolnameHash",  c.c_uint32 * VL4_HASHSIZE),
+                ("VolidHash",    (c.c_uint32 * VL4_MAXTYPES) * VL4_HASHSIZE),
+
+                # Points to a vl4_ex_headerblock
+                ("SIT",          c.c_int32)]
+assert_size(vl4_vlheader, 132120)
+
+class vl4_afsuuid(BigEndianStruct):
+    _fields_ = [("time_low", c.c_uint32),
+                ("time_mid", c.c_uint16),
+                ("time_hi_and_version", c.c_uint16),
+                ("clock_seq_hi_and_reserved", c.c_int8),
+                ("clock_seq_low", c.c_int8),
+                ("node", c.c_int8 * 6)]
+
+class vl4_ex_header(BigEndianStruct):
+    _fields_ = [("count",     c.c_int32),
+                ("spares1",   c.c_int32 * 2),
+                ("flags",     c.c_int32),
+
+                # contaddrs[0] points to a vl4_ex_headerblock (same as SIT).
+                # contaddrs[1..n] each point to a vl4_ex_addrblock.
+                ("contaddrs", c.c_uint32 * VL4_MAX_ADDREXTBLKS),
+                ("spares2",   c.c_int32 * 24)]
+
+class vl4_ex_addrentry(BigEndianStruct):
+    _fields_ = [("hostuuid", vl4_afsuuid),
+                ("uniquifier", c.c_int32),
+                ("addrs", c.c_uint32 * VL4_MAXIPADDRS_PERMH),
+                ("flags", c.c_uint32),
+                ("spares", c.c_int32 * 11)]
+
+# In C, ex_header and ex_addrentry are entries in a union. We're not doing that
+# here due to complications of the ctypes API, but the structs should have
+# exactly the same size. Make sure they are, so we don't screw up structs
+# containing these.
+assert_size(vl4_ex_header, 128)
+assert_size(vl4_ex_addrentry, 128)
+
+class vl4_ex_headerblock(BigEndianStruct):
+    _fields_ = [("ex_header", vl4_ex_header),
+                ("ex_addrentry", vl4_ex_addrentry * (VL4_MHSRV_PERBLK-1))]
+
+class vl4_ex_addrblock(BigEndianStruct):
+    _fields_ = [("ex_addrentry", vl4_ex_addrentry * VL4_MHSRV_PERBLK)]
+
+# Just double-check the size of our extaddr block structs
+assert_size(vl4_ex_headerblock, VL4_ADDREXTBLK_SIZE)
+assert_size(vl4_ex_addrblock, VL4_ADDREXTBLK_SIZE)
+
+class vl4_nvlentry(BigEndianStruct):
+    _fields_ = [("volumeId",        c.c_uint32 * VL4_MAXTYPES),
+                ("flags",           c.c_int32),
+                ("LockAfsId",       c.c_int32),
+                ("LockTimestamp",   c.c_int32),
+                ("cloneId",         c.c_uint32),
+                ("nextIdHash",      c.c_uint32 * VL4_MAXTYPES),
+                ("nextNameHash",    c.c_uint32),
+                ("name",            c.c_char * VL4_MAXNAMELEN),
+                ("serverNumber",    c.c_uint8 * VL4_NMAXNSERVERS),
+                ("serverPartition", c.c_uint8 * VL4_NMAXNSERVERS),
+                ("serverFlags",     c.c_uint8 * VL4_NMAXNSERVERS)]
+assert_size(vl4_nvlentry, 148)
+
+### Higher-level types
+
+# vldb4.ubik data
+
+class UbikFile:
+    def __init__(self, fh):
+        self.fh = fh
+        self.hdr = None
+        self.data_offset = ubik_hdr.HDRSIZE
+
+    @classmethod
+    def from_file(cls, fh):
+        ufile = cls(fh)
+        ufile.validate()
+        return ufile
+
+    def validate(self):
+        self.hdr = ubik_hdr.from_file(self.fh, 0)
+
+        if self.hdr.magic != ubik_hdr.UBIK_MAGIC:
+            raise UbikFormatError("Bad ubik header magic: %x != %x" %
+                                  (self.hdr.magic, ubik_hdr.UBIK_MAGIC))
+        if self.hdr.size != ubik_hdr.HDRSIZE:
+            raise UbikFormatError("Bad ubik header size: %d != %d" %
+                                  (self.hdr.size, ubik_hdr.HDRSIZE))
+
+    def seek(self, offset):
+        self.fh.seek(offset + self.data_offset)
+
+    def read(self, size):
+        return self.fh.read(size)
+
+# Format-agnostic data
+
+class VL_GlobalInfo:
+    max_volid = None
+
+class VL_Server:
+    uuid = None
+    addrs = None
+
+class VL_Volume:
+    name = None
+    id = None
+    sites = None
+    locked = False
+
+class VL_VolumeSite:
+    server = None
+    partition = None
+    type = None
+    notreleased = False
+    old = False
+
+class VL_Partition:
+    def __init__(self, number):
+        if number < 0 or number > 254:
+            raise ValueError("Invalid partition number %d"% number)
+        self.num = number
+
+    def __str__(self):
+        if self.num <= 25:
+            letter = chr(self.num + ord('a'))
+        else:
+            num = self.num-26
+            letter  = chr((num // 26) + ord('a'))
+            letter += chr((num % 26) + ord('a'))
+        return "vicep" + letter
+
+### VLDB file formats (meta)
+
+class FileFormat:
+    @classmethod
+    def def_format(cls, fmt):
+        cls.formats[fmt.format_name] = fmt
+
+    @classmethod
+    def get_format(cls, name):
+        return cls.formats[name]
+
+    @classmethod
+    def choices(cls):
+        return cls.formats.keys()
+
+### VLDB file formats (loading)
+
+class FileLoader(FileFormat):
+    formats = {}
+
+    def __init__(self, args, infile):
+        self.args = args
+        self.infile = infile
+        self.infh = None
+
+    def start(self):
+        if self.infh is None:
+            self.infh = open(self.infile, 'rb')
+
+@FileLoader.def_format
+class VLDB4UbikLoader(FileLoader):
+    format_name = 'vldb4.ubik'
+
+    VL4_HEADERSIZE = 132120
+
+    _vlheader = None
+    _db0 = None
+    _ex_addr = None
+
+    @property
+    def db0(self):
+        if self._db0 is not None:
+            return self._db0
+        db0 = UbikFile.from_file(self.infh)
+        self._db0 = db0
+        return db0
+
+    @property
+    def vlheader(self):
+        if self._vlheader is not None:
+            return self._vlheader
+
+        vlheader = vl4_vlheader.from_file(self.db0, 0)
+        vers = vlheader.vital_header.vldbversion
+        if vers != 4:
+            raise VL4FormatError("Wrong vldb version: %d != 4" % vers)
+
+        headersize = vlheader.vital_header.headersize
+        if headersize != self.VL4_HEADERSIZE:
+            raise VL4FormatError("Wrong header size: %d != %d" % (headersize,
+                                 self.VL4_HEADERSIZE))
+
+        self._vlheader = vlheader
+        return vlheader
+
+    @property
+    def ex_addr(self):
+        if self._ex_addr is not None:
+            return self._ex_addr
+
+        sit_addr = self.vlheader.SIT
+        if sit_addr == 0:
+            # No extent/MH records
+            return []
+
+        # Load the first extent block
+        block = vl4_ex_headerblock.from_file(self.db0, sit_addr)
+        header = block.ex_header
+        if header.contaddrs[0] != sit_addr:
+            raise VL4FormatError("extent header contaddrs[0] != SIT (%d != %d)" %
+                                 (header.contaddrs[0], sit_addr))
+
+        ex_addr = []
+
+        # ex_addr[0] contains the first set of ex_addrentry's, except
+        # ex_addr[0][0] is not valid (it represents the ex_header, not an
+        # addrentry). So to keep the array indices sane, but avoid accidental
+        # access to ex_addr[0][0], just set ex_addr[0][0] to None, and use the
+        # rest of the array normally.
+        ex_addr.append([None] + [*block.ex_addrentry])
+
+        # Load any extra extent blocks
+        for addr in header.contaddrs[1:]:
+            if addr != 0:
+                block = vl4_ex_addrblock.from_file(self.db0, addr)
+                ex_addr.append(block.ex_addrentry)
+            else:
+                ex_addr.append([])
+
+        self._ex_addr = ex_addr
+        return ex_addr
+
+    def get_globalinfo(self):
+        vlheader = self.vlheader
+        print("vlheader: %s" % vlheader)
+
+        ginfo = VL_GlobalInfo()
+        ginfo.max_volid = vlheader.MaxVolumeId
+        return ginfo
+
+    def serverno_to_server(self, serverno):
+            srv = VL_Server()
+            mhentry = self.serverno_to_mh(serverno)
+            if mhentry is not None:
+                # Server IP representing an MH entry
+                srv.uuid = uuid.UUID(bytes=bytes(mhentry.hostuuid))
+                srv.addrs = []
+                for ip in mhentry.addrs:
+                    if ip != 0:
+                        srv.addrs.append(ipaddress.IPv4Address(ip))
+                if len(srv.addrs) == 0:
+                    raise VL4FormatError("server MH %s has no addrs" % srv.uuid)
+
+            else:
+                # Non-MH server IP
+                srv.addrs = [ipaddress.IPv4Address(serverno)]
+            return srv
+
+    def serverno_to_mh(self, serverno):
+        if serverno & 0xff000000 != 0xff000000:
+            # serverno is a plain IP address; it doesn't refer to an MH entry
+            return None
+
+        # Server IP representing an MH entry
+        base = (serverno >> 16) & 0xff
+        index = serverno & 0xffff
+        mhentry = self.ex_addr[base][index]
+        return mhentry
+
+    def get_servers(self):
+        for maddr in self.vlheader.IpMappedAddr:
+            if maddr == 0:
+                # No addr in this slot
+                continue
+
+            srv = self.serverno_to_server(maddr)
+            yield srv
+
+    def get_volumes(self):
+        addr = c.sizeof(vl4_vlheader)
+        while addr < self.vlheader.eofPtr:
+            pct = addr * 100 // self.vlheader.eofPtr
+            print("Examining volumes... %d%%" % pct, end='\r', flush=True)
+
+            entry = vl4_nvlentry.from_file(self.db0, addr)
+            if entry.flags == VL4_CONTBLOCK:
+                # MH extent block; not a volume entry
+                addr += VL4_ADDREXTBLK_SIZE
+                continue
+
+            if entry.flags == VL4_FREE:
+                # Free entry; not a valid volume entry
+                addr += c.sizeof(vl4_nvlentry)
+                continue
+
+            yield self.vlentry_to_vol(entry)
+            addr += c.sizeof(vl4_nvlentry)
+
+    def enumerate_sites(self, vlentry):
+        for serverid, partno, sflags in zip(vlentry.serverNumber,
+                                            vlentry.serverPartition,
+                                            vlentry.serverFlags):
+            if serverid == VL4_BADSERVERID:
+                continue
+            yield (self.vlheader.IpMappedAddr[serverid], partno, sflags)
+
+    def vlentry_to_vol(self, vlentry):
+        vol = VL_Volume()
+        vol.name = vlentry.name.decode('utf-8')
+        vol.id = {}
+        if vlentry.volumeId[0] != 0:
+            vol.id['readwrite'] = vlentry.volumeId[0]
+        if vlentry.volumeId[1] != 0:
+            vol.id['readonly'] = vlentry.volumeId[1]
+        if vlentry.volumeId[2] != 0:
+            vol.id['backup'] = vlentry.volumeId[2]
+        if vlentry.cloneId != 0:
+            vol.id['clone'] = vlentry.cloneId
+
+        for lockbit, descr in [(VL4_VLOP_MOVE,    "move"),
+                               (VL4_VLOP_RELEASE, "release"),
+                               (VL4_VLOP_BACKUP,  "backup"),
+                               (VL4_VLOP_DELETE,  "misc"),
+                               (VL4_VLOP_DUMP,    "dump"),
+                              ]:
+            if vlentry.flags & lockbit != 0:
+                vol.locked = descr
+                break
+
+        # Do we have a mix of old and new sites?
+        some_new = False
+        some_old = False
+        for serverno, partno, sflags in self.enumerate_sites(vlentry):
+            if sflags & VL4_VLSF_NEWREPSITE != 0:
+                some_new = True
+            else:
+                some_old = True
+
+        mixed = False
+        if some_new and some_old:
+            mixed = True
+
+        vol.sites = []
+        for serverno, partno, sflags in self.enumerate_sites(vlentry):
+            site = VL_VolumeSite()
+            site.server = self.serverno_to_server(serverno)
+            site.partition = VL_Partition(partno)
+
+            if sflags & VL4_VLSF_RWVOL != 0:
+                site.type = 'readwrite'
+            else:
+                site.type = 'readonly'
+
+            if sflags & VL4_VLSF_DONTUSE != 0:
+                site.notreleased = True
+
+            if mixed and (sflags & VL4_VLSF_NEWREPSITE == 0):
+                site.old = True
+
+            vol.sites.append(site)
+        return vol
+
+
+### VLDB file formats (dumping)
+
+class FileDumper(FileFormat):
+    formats = {}
+
+    def __init__(self, args, outfile):
+        self.args = args
+        self.outfile = outfile
+        self.outfh = None
+
+    def start(self):
+        if self.outfh is None:
+            self.outfh = open(self.outfile, 'xb')
+
+@FileDumper.def_format
+class YamlDumper(FileDumper):
+    format_name = 'yaml'
+
+    dumper = None
+
+    def dump_all(self, loader):
+        ydumper = yaml.SafeDumper(self.outfh, encoding='utf-8')
+        self.ydumper = ydumper
+
+        ydumper.open()
+        ydumper.emit(yaml.DocumentStartEvent(explicit=True))
+        ydumper.emit(yaml.MappingStartEvent(anchor=None, tag=None, implicit=True))
+
+        ginfo = loader.get_globalinfo()
+        self.emit_dict_items({
+            "max_volid": ginfo.max_volid,
+        })
+
+        servers = []
+        for srv in loader.get_servers():
+            entry = {
+                'addrs': [str(addr) for addr in srv.addrs],
+            }
+            if srv.uuid is not None:
+                entry['uuid'] = str(srv.uuid)
+            servers.append(entry)
+        self.emit_dict_items({
+            "fileservers": servers,
+        })
+
+        self.emit_data("volumes")
+        ydumper.emit(yaml.SequenceStartEvent(anchor=None, tag=None, implicit=True))
+        for vol in loader.get_volumes():
+            self.emit_volume(vol)
+        ydumper.emit(yaml.SequenceEndEvent())
+
+        ydumper.emit(yaml.MappingEndEvent())
+        ydumper.emit(yaml.DocumentEndEvent())
+        ydumper.close()
+
+    def emit_volume(self, vol):
+        info = {}
+        info['name'] = vol.name.decode('ascii')
+        info['id'] = {}
+        info['id'].update(vol.id)
+        if vol.locked:
+            info['locked'] = vol.locked
+
+        info['sites'] = []
+        for site in vol.sites:
+            siteinfo = {
+                'type': site.type,
+                'server': str(site.server.addrs[0]),
+                'partition': str(site.partition),
+            }
+            if site.notreleased:
+                siteinfo['notreleased'] = site.notreleased
+            if site.old:
+                siteinfo['old'] = site.old
+            info['sites'].append(siteinfo)
+        self.emit_data(info)
+
+    def emit_dict_items(self, d):
+        for key, val in d.items():
+            self.emit_data(key)
+            self.emit_data(val)
+
+    def emit_data(self, val):
+        # Note: the pure-python yaml is really slow when emitting a lot of
+        # data! (~10s for only 10k volumes). Ideally we would use the C-based
+        # yaml dumper, but the following code does not work as-is with it
+        # (anchor_node/serialize_node do not exist). I cannot figure out how to
+        # get the streaming functions to work with the C-based dumper at the
+        # moment, so for now this will just be slow.
+        node = self.ydumper.represent_data(val)
+        self.ydumper.anchor_node(node)
+        self.ydumper.serialize_node(node, None, None)
+
+### Option parsing, etc
+
+def run_convert(args, loader, dumper):
+    loader.start()
+    dumper.start()
+
+    dumper.dump_all(loader)
+
+def main(argv):
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('infile', help='input file name')
+
+    parser.add_argument('outfile', help='output file name')
+
+    parser.add_argument('--from', '-f', default='vldb4.ubik', help='input file format',
+                        dest='from_type',
+                        type=FileLoader.get_format,
+                        choices=FileLoader.choices())
+
+    parser.add_argument('--to', '-t', default='yaml', help='output format',
+                        dest='to_type',
+                        type=FileDumper.get_format,
+                        choices=FileDumper.choices())
+
+    args = parser.parse_args(argv[1:])
+
+    loader = args.from_type(args, infile=args.infile)
+    dumper = args.to_type(args, outfile=args.outfile)
+
+    run_convert(args, loader, dumper)
+
+if __name__ == '__main__':
+    main(sys.argv)
