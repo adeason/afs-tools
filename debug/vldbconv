@@ -1389,6 +1389,32 @@ class VL_Partition:
             letter += chr((num % 26) + ord('a'))
         return "vicep" + letter
 
+    @classmethod
+    def from_str(cls, partname):
+        if partname.startswith('vicep'):
+            partname = partname[5:]
+        elif partname.startswith('/vicep'):
+            partname = partname[6:]
+
+        if len(partname) == 2:
+            first = ord(partname[0]) - ord('a') + 1
+            second = ord(partname[1]) - ord('a')
+
+        elif len(partname) == 1:
+            first = 0
+            second = ord(partname[0]) - ord('a')
+
+        else:
+            raise InternalError()
+
+        if first < 0 or first >= 26:
+            raise InternalError()
+        if second < 0 or second >= 26:
+            raise InternalError()
+
+        partnum = first * 26 + second
+        return cls(partnum)
+
 ### VLDB file formats (meta)
 
 class FileFormat:
@@ -1417,6 +1443,139 @@ class FileLoader(FileFormat):
     def start(self):
         if self.infh is None:
             self.infh = open(self.infile, 'rb')
+
+@FileLoader.def_format
+class YamlLoader(FileLoader):
+    format_name = 'yaml'
+    servers = None
+
+    def assume_node(self, node, node_type):
+        if not isinstance(node, node_type):
+            raise InternalError("Unexpected yaml node: %r" % node)
+
+    def reset(self):
+        if self.servers is None:
+            self.servers = []
+
+        self.infh.seek(0)
+        self.yaml = yaml.SafeLoader(self.infh)
+
+        # Skip over the first stream, document, and mapping events.
+        if self.yaml.check_event(yaml.StreamStartEvent):
+            self.yaml.get_event()
+        if self.yaml.check_event(yaml.DocumentStartEvent):
+            self.yaml.get_event()
+        if self.yaml.check_event(yaml.MappingStartEvent):
+            self.yaml.get_event()
+
+    def nodes(self):
+        while True:
+            node = self.yaml.compose_node(None, None)
+            yield node
+
+    def find_key(self, a_key):
+        self.reset()
+
+        for node in self.nodes():
+            self.assume_node(node, yaml.ScalarNode)
+            key = node.value
+            if key == a_key:
+                return
+
+            val_node = self.yaml.compose_node(None, None)
+
+    def next_scalar(self):
+        node = self.yaml.compose_node(None, None)
+        self.assume_node(node, yaml.ScalarNode)
+        return node.value
+
+    def next_sequence(self):
+        node = self.yaml.compose_node(None, None)
+        self.assume_node(node, yaml.SequenceNode)
+        return self.yaml.construct_sequence(node, deep=True)
+
+    def next_mapping(self):
+        node = self.yaml.compose_node(None, None)
+        self.assume_node(node, yaml.MappingNode)
+        return self.yaml.construct_mapping(node, deep=True)
+
+    def next_event(self, evtype):
+        ev = self.yaml.get_event()
+        if not isinstance(ev, evtype):
+            raise InternalError("Unexpected yaml event %r" % ev)
+
+    def get_globalinfo(self):
+        ginfo = VL_GlobalInfo()
+
+        self.find_key('next_volid')
+        val = self.next_scalar()
+        ginfo.next_volid = int(val)
+        return ginfo
+
+    def get_servers(self):
+        self.find_key('fileservers')
+        server_list = self.next_sequence()
+
+        for y_srv in server_list:
+            srv = VL_Fileserver()
+            srv.uuid = uuid.UUID(y_srv['uuid'])
+
+            srv.addrs = []
+            for y_addr in y_srv['addrs']:
+                srv.addrs.append(ipaddress.ip_address(y_addr))
+
+            self.servers.append(srv)
+
+            yield srv
+
+    def find_server(self, addr):
+        ipaddr = ipaddress.ip_address(addr)
+        for srv in self.servers:
+            for s_addr in srv.addrs:
+                if s_addr == ipaddr:
+                    return srv
+        raise InternalError("Could not find server with address %r" % addr)
+
+    def get_volumes(self):
+        if len(self.servers) < 1:
+            for srv in self.get_servers():
+                pass
+
+        self.find_key('volumes')
+
+        self.next_event(yaml.SequenceStartEvent)
+
+        while not self.yaml.check_event(yaml.SequenceEndEvent):
+            y_vol = self.next_mapping()
+
+            vol = VL_Volume()
+            vol.name = y_vol['name'].encode('ascii')
+            vol.id = y_vol['id']
+
+            if 'locked' in y_vol:
+                vol.locked = y_vol['locked']
+            if 'bkexists' in y_vol:
+                vol.bkexists = y_vol['bkexists']
+
+            vol.sites = []
+            for y_site in y_vol['sites']:
+                site = VL_VolumeSite()
+
+                srv = self.find_server(y_site['server'])
+                site.server = srv
+                site.partition = VL_Partition.from_str(y_site['partition'])
+                site.type = y_site['type']
+
+                if 'notreleased' in y_site:
+                    site.notreleased = y_site['notreleased']
+                if 'old' in y_site:
+                    site.old = y_site['old']
+
+                vol.sites.append(site)
+
+            yield vol
+
+        self.next_event(yaml.SequenceEndEvent)
 
 @FileLoader.def_format
 class VLDB4UbikLoader(FileLoader):
