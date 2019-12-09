@@ -1,9 +1,15 @@
 #!/usr/bin/python3
 
 import argparse
+import crcmod.predefined
 import ctypes as c
 import ipaddress
+import math
+import operator
+import pprint
 import sys
+import time
+import typing as t
 import uuid
 import yaml
 
@@ -12,14 +18,24 @@ import yaml
 class UbikFormatError(Exception): pass
 class VL4FormatError(Exception): pass
 class InternalError(Exception): pass
+class UnsupportedError(Exception): pass
+class VL5_DuplicateKeyError(Exception): pass
 
-### Low-level structs, etc.
+### Low-level structs meta
+
+# Convience shortcuts for big-endian 32-bit and 64-bit ints.
+c_uint32_be = c.c_uint32.__ctype_be__
+c_uint64_be = c.c_uint64.__ctype_be__
 
 class BigEndianStruct(c.BigEndianStructure):
     _pack_ = 1
 
     def to_bytes(self):
         return bytes(self)
+
+    def to_file(self, fh, offset):
+        fh.seek(offset)
+        fh.write(self.to_bytes())
 
     @classmethod
     def from_bytes(cls, buf):
@@ -47,9 +63,10 @@ def assert_size(cstruct, size):
     if c.sizeof(cstruct) != size:
         raise AssertionError("sizeof(%s)is %d, not %d" % (cstruct.__name__,
                              c.sizeof(cstruct), size))
-    #print("sizeof(%s) == %d" % (cstruct.__name__, size))
 
-# Ubik structs
+### Ubik structs/data
+
+# Lower-level (C structs, etc)
 
 class ubik_version(BigEndianStruct):
     _fields_ = [("epoch",   c.c_uint32),
@@ -64,7 +81,53 @@ class ubik_hdr(BigEndianStruct):
                 ("size",    c.c_uint16),
                 ("version", ubik_version)]
 
-# VLDB v4 structs
+# Higher-level
+
+class UbikFile:
+    def __init__(self, fh):
+        self.fh = fh
+        self.hdr = None
+        self.data_offset = ubik_hdr.HDRSIZE
+
+    @classmethod
+    def from_file(cls, fh):
+        ufile = cls(fh)
+        ufile.validate()
+        return ufile
+
+    def validate(self):
+        self.hdr = ubik_hdr.from_file(self.fh, 0)
+
+        if self.hdr.magic != ubik_hdr.UBIK_MAGIC:
+            raise UbikFormatError("Bad ubik header magic: %x != %x" %
+                                  (self.hdr.magic, ubik_hdr.UBIK_MAGIC))
+        if self.hdr.size != ubik_hdr.HDRSIZE:
+            raise UbikFormatError("Bad ubik header size: %d != %d" %
+                                  (self.hdr.size, ubik_hdr.HDRSIZE))
+
+    def seek(self, offset):
+        self.fh.seek(offset + self.data_offset)
+
+    def read(self, size):
+        return self.fh.read(size)
+
+    def write(self, buf):
+        self.fh.write(buf)
+
+    def write_header(self, epoch, counter):
+        hdr = ubik_hdr()
+        hdr.magic = ubik_hdr.UBIK_MAGIC
+        hdr.size = ubik_hdr.HDRSIZE
+        hdr.version.epoch = epoch
+        hdr.version.counter = counter
+        if not isinstance(hdr, ubik_hdr):
+            raise TypeError("Expecting a ubik_hdr, not a %s" % type(hdr))
+        self.fh.seek(0)
+        self.fh.write(bytes(hdr))
+
+### VLDB v4 structs/data
+
+# Lower level C structs
 
 VL4_MAXSERVERID = 254
 VL4_BADSERVERID = 255
@@ -87,6 +150,7 @@ VL4_VLOP_RELEASE =     0x20
 VL4_VLOP_BACKUP =      0x40
 VL4_VLOP_DELETE =      0x90
 VL4_VLOP_DUMP =       0x100
+VL4_VLF_BACKEXISTS = 0x4000
 
 # vl4_nvlentry.serverFlags flags
 VL4_VLSF_NEWREPSITE = 0x1
@@ -171,44 +235,1128 @@ class vl4_nvlentry(BigEndianStruct):
                 ("serverFlags",     c.c_uint8 * VL4_NMAXNSERVERS)]
 assert_size(vl4_nvlentry, 148)
 
-### Higher-level types
+### VLDB v5 structs/data
 
-# vldb4.ubik data
+# Lower-level C structs/defines
 
-class UbikFile:
-    def __init__(self, fh):
-        self.fh = fh
-        self.hdr = None
-        self.data_offset = ubik_hdr.HDRSIZE
+# An unused/blank value or record.
+VL5_TAG_NULL = 0x00
 
-    @classmethod
-    def from_file(cls, fh):
-        ufile = cls(fh)
-        ufile.validate()
-        return ufile
+# The root record (when using big-endian).
+VL5_TAG_ROOT_BE       = 0x05
+# The root record (when using little-endian).
+VL5_TAG_ROOT_LE = 0x05000000
 
-    def validate(self):
-        self.hdr = ubik_hdr.from_file(self.fh, 0)
+# Value containing a vl5_funinfo struct. Contains information fundamental for
+# interpreting the db values (endianness and such). Note that the tag constant
+# is the same whether in big-endian or little-endian.
+VL5_TAG_FUNINFO_BE = 0x55555555
 
-        if self.hdr.magic != ubik_hdr.UBIK_MAGIC:
-            raise UbikFormatError("Bad ubik header magic: %x != %x" %
-                                  (self.hdr.magic, ubik_hdr.UBIK_MAGIC))
-        if self.hdr.size != ubik_hdr.HDRSIZE:
-            raise UbikFormatError("Bad ubik header size: %d != %d" %
-                                  (self.hdr.size, ubik_hdr.HDRSIZE))
+# Value with a u64 payload indicating how many records exist in the db (and so,
+# indicates EOF). Any records greater than or equal this number are invalid.
+VL5_TAG_EOF          = 0x06
 
-    def seek(self, offset):
-        self.fh.seek(offset + self.data_offset)
+# The "CONTINUE" tags that follow are for allowing more than 'recsize' bytes of
+# data in a record. We assume that almost all data for a record fits inside the
+# recsize limit, but if we need to occasionally exceed this limit, we can chain
+# together records using these "CONTINUE" values/records.
+#
+# A VL5_TAG_CONTINUE_PTR value contains a payload of an array of u64 recnos,
+# indicating records with the tag VL5_TAG_CONTINUE_REC. A VL5_TAG_CONTINUE_REC
+# record contains just a VL5_TAG_CONTINUE_HDR value, which contains a
+# vl5_continue_hdr struct that indicates the previous/parent recno (the recno
+# of the record containing the VL5_TAG_CONTINUE_PTR pointing to us). After the
+# VL5_TAG_CONTINUE_HDR value, the entire rest of the record payload is
+# considered concatenated to the parent/previous record.
+#
+# The parent/previous data in vl5_continue_hdr is just for validity checking
+# and for helping reconstruct data after db corruption.
+#
+# A VL5_TAG_CONTINUE_REC record can contain another VL5_TAG_CONTINUE_HDR val,
+# indicating more continuation records; this is useful if the parent record
+# doesn't have enough space to contain all the continuation records it needs to
+# specify (but we probably shouldn't need this many continuation records!). If
+# this is done, those records are concatenated after the records specified in
+# the parent. That is, the contiuation records are concatenated in the order
+# they logically appear in the stream.
+#
+# For example, say we have some records that look like this:
+#
+# recno 1 {
+#  VL5_TAG_CONTINUE_PTR = [2,3]
+# }
+# recno 2 {
+#  VL5_TAG_CONTINUE_PTR = [4,5]
+# }
+#
+# The thing parsing the db would see recno 1 specifies cont records in 2 and 3,
+# and so the view of recno 1 is updated to look like:
+#
+# recno 1 {
+#  [orig contents of 1]
+#  [contents of 2]
+#  [contents of 3]
+# }
+#
+# Then of course recno 2 contains more continuation records; those are appended
+# to the view of recno 1, and so the view of recno 1 looks like this:
+#
+# recno 1 {
+#  [orig contents of 1]
+#  [contents of 2]
+#  [contents of 3]
+#  [contents of 4]
+#  [contents of 5]
+# }
+VL5_TAG_CONTINUE_PTR = 0x07
+VL5_TAG_CONTINUE_REC = 0x08
+VL5_TAG_CONTINUE_HDR = 0x09
 
-    def read(self, size):
-        return self.fh.read(size)
+# Value with a u64 payload indicating the recno of the first available
+# VL5_TAG_FREE_REC record (or 0 if none).
+VL5_TAG_FREE_PTR = 0x0C
+
+# Record containing a free record; contains nothing but a VL5_TAG_FREE_VAL
+# value.
+VL5_TAG_FREE_REC     = 0x0D
+
+# Value with a vl5_free_val payload indicating the next free record (or 0, if
+# this is the end of the freelist).
+VL5_TAG_FREE_NEXT    = 0x0E
+
+# Value with a u64 payload indicating the next available volume id to use.
+VL5_TAG_NEXT_VOLID   = 0x10
+
+# Record containing information about a fileserver. Contains values for the
+# uuid of the fileserver (VL5_TAG_FS_UUID), the addresses for the fileserver
+# (VL5_TAG_FS_IPV4LIST), etc.
+VL5_TAG_FILESERVER   = 0x11
+
+# Value containing the UUID of a fileserver. This is NOT serialized via xdr;
+# this is serialized using the normal UUID big-endian byte representation (even
+# if the rest of the database is flagged as little-endian).
+VL5_TAG_FS_UUID      = 0x12
+
+# Value containing a list of ipv4 addresses for a fileserver. (For ipv6
+# addresses, or if we want to add port numbers or other protocols etc, add them
+# in a new value.) Serialized like a simple xdr array: 'afs_uint32<>'.
+VL5_TAG_FS_IPV4LIST = 0x13
+
+# Value with a u64 payload indicating the recno of a
+# VL5_TAG_FILESERVER_LIST_REC record.
+VL5_TAG_FILESERVER_LIST_PTR = 0x14
+
+# Record containing the list of defined fileservers. Contains
+# VL5_TAG_FS_RECNO_LIST values.
+VL5_TAG_FILESERVER_LIST_REC = 0x15
+
+# Value contains a list of (fileserver_id, recno) pairs, mapping a fileserver
+# id number to a VL5_TAG_FILESERVER record defining that fileserver. Something
+# like this in xdr:
+# struct fs_recno_item {
+#     afs_uint32 fileserver_id;
+#     afs_uint64 recno;
+# }
+# typedef fs_recno_list fs_recno_item<>;
+VL5_TAG_FS_RECNO_LIST = 0x16
+
+# Value with a u64 payload indicating the recno of a VL5_TAG_PARTITION_LIST_REC
+# record.
+VL5_TAG_PARTITION_LIST_PTR = 0x17
+
+# Record containing the list of defined fileserver partitions. Contains
+# VL5_TAG_PARTITION_LIST_VAL values.
+VL5_TAG_PARTITION_LIST_REC = 0x18
+
+# Value containing mappings from an internal partition id to a
+# fileserver,partition pair.
+# struct part_recno_item {
+#     afs_uint32 part_id;
+#     afs_uint32 fileserver_id;
+#     afs_uint32 part_letter;
+# }
+# typedef part_recno_list part_recno_item<>;
+#
+# Note that we just have a global list defining all known partitions (and
+# saying which fileserver they are, and which partition letter). We do not have
+# a per-fs partition list inside each fileserver record. Why not?
+#
+# Most lookups will reference a partition id directly (when we lookup a
+# vlentry, and need to give the information to a client, we need to map the
+# partid into a server IP and partition letter). And so, we will have the
+# global list of partitions cached in the application; we won't be hitting ubik
+# to resolve partition ids for every request, since we need to access it for
+# almost every request.
+#
+# For some lookups (admin operations updating vlentry's), we will need to
+# lookup server,letter pairs into partition ids. That would be easier to lookup
+# if we had a per-fs list of partitions, but as explained above, the entire
+# partition list will be cached in application memory. So the application can
+# just setup a (server,letter -> partid) mapping table if it wants to.
+#
+# Creating a per-fs partition list is an extra item we'd need to keep track of,
+# and it could theoretically get out of sync with the global partition list.
+# Since it's not necessary, we avoid doing that to avoid another thing that can
+# be wrong in the db, that we need to keep track of.
+VL5_TAG_PARTITION_LIST_VAL = 0x19
+
+# Value with a u64 payload indicating the recno of a VL5_TAG_NOTE_REC record.
+VL5_TAG_NOTE_PTR = 0x1A
+
+# Record containing 'note' data for an item in the database. Contains
+# VL5_TAG_NOTE_UTF8 values.
+VL5_TAG_NOTE_REC = 0x1B
+
+# Value containing 'note' data encoded in UTF-8.
+VL5_TAG_NOTE_UTF8 = 0x1C
+
+# Record containing a volume entry. Contains values for the volume name, sites,
+# etc.
+VL5_TAG_VOLUME = 0x1D
+
+# Value containing a variable-length volume name string (plain bytes, no known
+# encoding).
+VL5_TAG_VOL_NAME = 0x1E
+
+# Value containing a struct vl5_vol_basicinfo, indicating the "basic"/common
+# ids for the volume (rw, ro, bk) and a little bit of other misc info. Other id
+# types in the future can go in other values.
+VL5_TAG_VOL_BASIC_INFO = 0x1F
+
+# Value containing a u64 for the volume's cloneId (if it has one).
+VL5_TAG_VOL_CLONEID = 0x20
+
+# Value containing information about a volume being locked. Consists of a
+# struct vl5_vol_lockinfo.
+VL5_TAG_VOL_LOCKINFO = 0x21
+
+# Value containing a list of vl5_vol_site structs. In xdr: 'vl5_vol_site<>'.
+VL5_TAG_VOL_SITELIST = 0x22
+
+# For looking up volumes, we use (modified) b+-trees. We store the tree
+# information, pointers etc, separate from the volume entries themselves; the
+# vlentry structs do not have any hash/tree pointers inside them. The v4 vldb
+# stored hash chain pointers inside the vlentry, which meant you had to do a
+# separate read from disk for every step of the hash chain traversal.
+#
+# downside that b-trees have a more complex 'delete' operation.
+#
+# Optimizing frequently-accessed entries can be done instead by an in-memory
+# application cache. Implementing a b+-tree and just doing that seems easier.
+#
+# Q: Why not a normal hash table, like vldb v4?
+#
+# One of the bigger intrinsic problems with v4 was the hash table(s), since
+# they were of a hard-coded fixed size. Once a vldb has enough volumes, the
+# hash chains get long, requiring numerous disk reads for pretty much every
+# single lookup.
+#
+# This could be solved by making a bigger hash table, of course, but we don't
+# know in advance how big to make it. We could grow the hash table after a
+# certain number of volumes have been added, but that usually requires
+# re-hashing everything in the database, and it requires growing the hash table
+# array itself.
+#
+# We can avoid re-hashing everything in the db by using an "extendible hashing"
+# scheme, but growing the hash still requires growing the hash table array
+# itself. By that I mean, say we allocate 1 record for the hash table, giving
+# us, say, at most 100-ish buckets for a 1k recsize. Then we create enough
+# volumes so that's not enough, and we want to grow the hash table to twice the
+# size (200-ish buckets). We could allocate a new record and extent the hash
+# table record with a CONTINUE_REC value, but that means reading O(n) records
+# to do the hash lookup.
+#
+# Or we could add a layer of indirection, so the root record for the hash table
+# contains 100 recno's, which contain the hash table for 100 buckets
+# themselves. Now we effectively have 10k buckets, for 2 lookups each. If we do
+# it again, we can have 2 layers of indirection like this, giving us 1M
+# buckets. And so on.
+#
+# Adding these "layers" of hash buckets is basically constructing a tree, so we
+# can just use a b+-tree instead. A b+-tree can add layers like this more
+# gradually, is better at balancing, and for volids doesn't even need hashing
+# (so there's no separate list of collisions at the end, no hash chain).
+#
+# If we had a way to have the hash table array grow without O(n) access time, a
+# traditional hashing scheme could be better than using b+-trees. For instance,
+# if we were able to store the hash buckets in a separate file stream, we could
+# grow that file stream indefinitely without needing to worry about allocation
+# or fragmentation, etc. Ubik theoretically has the ability to support multiple
+# files for a database, but it hasn't ever been used in OpenAFS, so making that
+# functional seems like a lot of work.
+
+# For looking up volumes by ID, we use a modified b+-tree structure, where the
+# keys are the 64-bit volid, and the values are the 64-bit recno for the volume
+# entry. The only modification from a textbook b+-tree structure right now is
+# that we don't have the leaves point to the other leaves, since we don't care
+# about in-order traversal.
+#
+# The root record contains a VL5_TAG_VOL_IDTREE_PTR value that consists of a
+# single recno pointing to a VL5_TAG_VOL_IDTREE_REC record (the root of the
+# tree).
+#
+# A VL5_TAG_VOL_IDTREE_REC record represents a node in the tree. A leaf node
+# contains a VL5_TAG_VOL_IDTREE_LEAF value, and a non-leaf node contains a
+# VL5_TAG_VOL_IDTREE_NODE value.
+VL5_TAG_VOL_IDTREE_PTR  = 0x23
+VL5_TAG_VOL_IDTREE_REC  = 0x24
+VL5_TAG_VOL_IDTREE_LEAF = 0x25
+VL5_TAG_VOL_IDTREE_NODE = 0x26
+
+# For looking up volumes by name, we also use a b+-tree with generally the same
+# layout as the volid tree. Differences:
+#
+# - Our keys are the hash of the volume name, not the volume name itself. Our
+# leaves at the end of the tree also contain the full name of the volume they
+# point to. (Alternatively we could have the leaves point to a "collision list"
+# where we list all of the entries that have the same hash, but this way should
+# require one fewer disk lookup.)
+#
+# - The hash we use (see below, VL5_NAMEHTREE_HASHFUNC_*) only outputs 32 bits,
+# which means our keys are only 32-bit. This increases the chances of
+# collisions (vs a 64-bit key), but it does let us stuff more keys into a tree
+# node.
+#
+# Q: Why not store the volume names as keys directly, instead of using hashes?
+#
+# The main downside with doing this is that the names take up more space than a
+# hash. e.g. say each entry in a node contains a hash (4 bytes) and a recno (8
+# bytes), vs each entry contains a volume name (average 10 bytes) and a recno
+# (8 bytes). That's 12 bytes vs 18 bytes per entry, so with a hash, we can
+# store roughly 50% more entries per node, resulting in signifcantly better
+# fanout (with only 10 bytes per volume name, which is a bit low). There are
+# ways to "compress" the keys, but the ones I've found sound complex and have
+# varying pros/cons; there's no obvious standard choice.
+#
+# Many/most modern Linux-y filesystems use the hashing approach when storing
+# dir entries in a b-tree, I believe (XFS (custom hash), btrfs (crc32c),
+# ext2/3/4 with dir_index (TEA/md4/custom)). ZFS uses an extendible hashing
+# scheme, instead of a b-tree.
+#
+# HFS+ and JFS2 I believe use the actual dir entry names as keys. JFS uses a
+# technique it calls "key suffix compression" for reducing the space needed for
+# storing the keys, but I think it only works in the lowest level of the tree?
+# I have trouble finding a good explanation for the relevant algorithm (which
+# is perhaps a reason in itself to avoid this).
+#
+# All the databases I could find do not hash the keys when storing data in
+# b-trees, since they use b-trees for sortable data. For hash data, they tend
+# to just use the normal flat hash table array approach.
+#
+# One possible benefit to using the name as the b-tree key directly is that it
+# means we don't have any hash collisions, so the lookup operation returns a
+# single result, instead of a list of candidates. It also doesn't depend on a
+# hashing algorithm that's effectively baked in to the db format.
+#
+# The better approach is probably the simpler one; the difference in
+# performance impact probably doesn't matter much. I think the hashing approach
+# sounds like the simpler approach, since there's fewer variable-length strings
+# floating around, but I'm not sure yet.
+
+# We call the name tree structure the "namehtree" for short (name hash b+-tree
+# -> namehtree). In the root record, VL5_TAG_VOL_NAMEHTREE_PTR is a value that
+# points to a recno for a VL5_TAG_VOL_NAMEHTREE_REC record. Each
+# VL5_TAG_VOL_NAMEHTREE_REC record represents a node in the tree. A leaf node
+# contains a VL5_TAG_VOL_NAMEHTREE_LEAF value, and a non-leaf node contains a
+# VL5_TAG_VOL_NAMEHTREE_NODE value.
+VL5_TAG_VOL_NAMEHTREE_PTR  = 0x27
+VL5_TAG_VOL_NAMEHTREE_REC  = 0x28
+VL5_TAG_VOL_NAMEHTREE_LEAF = 0x29
+VL5_TAG_VOL_NAMEHTREE_NODE = 0x2A
+
+# Value in the root namehtree node, which contains some tree-global metadata.
+# (e.g. which hash algorithm we are using)
+VL5_TAG_VOL_NAMEHTREE_ROOTINFO = 0x2B
+
+# VL5_TAG_VOL_NAMEHTREE_LEAF values can point to a record containing a volume
+# entry (VL5_TAG_VOLUME), or point to a collision record
+# (VL5_TAG_VOL_NAMEHTREE_COLL_REC). The collision record contains a
+# VL5_TAG_VOL_NAMEHTREE_COLL_VAL value that contains a flat array pointing to
+# actual volume entry records.
+VL5_TAG_VOL_NAMEHTREE_COLL_REC = 0x2C
+VL5_TAG_VOL_NAMEHTREE_COLL_VAL = 0x2D
+
+vl5_fsid = c.c_uint32
+vl5_partid = c.c_uint32
+vl5_recno = c.c_uint64
+vl5_volid = c.c_uint64
+vl5_timestamp = c.c_uint64
+
+# A "record" just contains a u32 at the beginning of the record, indicating the
+# record type. The rest of the record is filled with "values". The size of the
+# entire record is the fixed record-size (specified in the VL5_TAG_FUNINFO_BE
+# value in the root record).
+class vl5_recheader(BigEndianStruct):
+    _fields_ = [("tag", c.c_uint32)]
+
+# A "value" consists of a u32 tag, then a u32 length, then 'length' bytes of
+# payload ('length' may be 0).
+class vl5_valheader(BigEndianStruct):
+    _fields_ = [("tag",    c.c_uint32),
+                ("length", c.c_uint32)]
+
+# Fundamental db metadata; information needed to decode the db values at all.
+VL5_ENDIAN_BIG = 1
+class vl5_funinfo(BigEndianStruct):
+    # In XDR, actually a single uint32, where the upper 8 bits are 'endian',
+    # and the next 8 bits are 'recsize_log2'.
+    _fields_ = [("endian", c.c_uint8),
+                ("recsize_log2", c.c_uint8),
+                ("padding", c.c_uint8 * 2)]
+
+def vl5_bytestr(n_chars):
+    class vl5_bytestr_s(BigEndianStruct):
+        _pack_ = 4
+        _fields_ = [("len", c.c_uint32),
+                    ("bytestr", c.c_char * n_chars)]
+    return vl5_bytestr_s
+
+class vl5_continue_hdr(BigEndianStruct):
+    _fields_ = [("parent_recno", vl5_recno)]
+
+class vl5_free_val(BigEndianStruct):
+    _fields_ = [("prev_recno", vl5_recno),
+                ("next_recno", vl5_recno)]
+
+def vl5_ipv4list(n_items):
+    class vl5_ipv4list_s(BigEndianStruct):
+        _fields_ = [("len", c.c_uint32),
+                    ("val", c.c_uint32 * n_items)]
+    return vl5_ipv4list_s
+
+class vl5_fs_reclist_item(BigEndianStruct):
+    _fields_ = [("fsid", vl5_fsid),
+                ("recno", vl5_recno)]
+
+def vl5_fs_reclist(n_items):
+    class vl5_fs_reclist_s(BigEndianStruct):
+        _fields_ = [("len", c.c_uint32),
+                    ("val", vl5_fs_reclist_item * n_items)]
+    return vl5_fs_reclist_s
+
+# Note that we don't track VLF_RWEXISTS/VLF_ROEXISTS. We can deduce the values
+# for those flags based on if rw/ro sites exist for the volume.
+class vl5_vol_basicinfo(BigEndianStruct):
+    _fields_ = [("rwid", vl5_volid),
+                ("roid", vl5_volid),
+                ("bkid", vl5_volid),
+                ("vlf_backexists", c.c_uint32)]
+
+VL5_LOCK_MOVE    = 1
+VL5_LOCK_RELEASE = 2
+VL5_LOCK_BACKUP  = 3
+VL5_LOCK_DELETE  = 4
+VL5_LOCK_DUMP    = 5
+VL5_LOCK_UNKNOWN = 6
+class vl5_vol_lockinfo(BigEndianStruct):
+    _fields_ = [("locktype", c.c_uint32),
+                ("time", vl5_timestamp),
+                ("duration", vl5_timestamp),
+                ("userid", c.c_uint64)]
+
+VL5_SITE_RW = 1
+VL5_SITE_RO = 2
+class vl5_vol_site(BigEndianStruct):
+    _fields_ = [("type", c.c_uint32),
+                ("partid", vl5_partid),
+                ("flags", c.c_uint32)]
+
+def vl5_vol_sitelist(n_items):
+    class vl5_vol_sitelist_s(BigEndianStruct):
+        _fields_ = [("len", c.c_uint32),
+                    ("val", vl5_vol_site * n_items)]
+    return vl5_vol_sitelist_s
+
+class vl5_partlist_item(BigEndianStruct):
+    _fields_ = [("partid", vl5_partid),
+                ("fsid", vl5_fsid),
+                ("partnum", c.c_uint32)]
+
+def vl5_partlist(n_items):
+    class vl5_partlist_s(BigEndianStruct):
+        _fields_ = [("len", c.c_uint32),
+                    ("val", vl5_partlist_item * n_items)]
+    return vl5_partlist_s
+
+class vl5_idtree_node_entry(BigEndianStruct):
+    _fields_ = [("max_volid", vl5_volid),
+                ("child", vl5_recno)]
+
+def vl5_idtree_node(n_keys):
+    class vl5_idtree_node_s(BigEndianStruct):
+        _fields_ = [("parent", vl5_recno),
+                    ("max_child", vl5_recno),
+                    ("n_keys", c.c_uint32),
+                    ("children", vl5_idtree_node_entry * n_keys)]
+    return vl5_idtree_node_s
+
+class vl5_idtree_leaf_entry(BigEndianStruct):
+    _fields_ = [("volid", vl5_volid),
+                ("vlentry", vl5_recno)]
+
+def vl5_idtree_leaf(n_keys):
+    class vl5_idtree_leaf_s(BigEndianStruct):
+        _fields_ = [("parent", vl5_recno),
+                    ("n_keys", c.c_uint32),
+                    ("children", vl5_idtree_leaf_entry * n_keys)]
+    return vl5_idtree_leaf_s
+
+# What hash function to use? Unlike many hash function applications, we don't
+# care so much about cpu performance, distribution, avalanche effects, or
+# security; we care more about collision avoidance and portability/standards.
+#
+# Possibly the easiest choice for the OpenAFS source tree is the jenkins
+# lookup3 hash, because it already exists in the OpenAFS source as 'jhash'. But
+# that seems more suited to in-memory hash tables and such, where we truncate
+# the value and the algorithm can be changed easily.
+#
+# A more universal choice is CRC32C (CRC32-Castagnoli, a slightly better
+# CRC32), which is used in various other formats and protocols (btrfs, iSCSI,
+# SCTP). Just going with that for now.
+VL5_NAMEHTREE_HASHFUNC_CRC32C = 0x1
+class vl5_namehtree_rootinfo(BigEndianStruct):
+    _fields_ = [("hashfunc", c.c_uint32)]
+
+class vl5_namehtree_node_entry(BigEndianStruct):
+    _fields_ = [("max_hash", c.c_uint32),
+                ("child", vl5_recno)]
+
+def vl5_namehtree_node(n_keys):
+    class vl5_namehtree_node_s(BigEndianStruct):
+        _fields_ = [("parent", vl5_recno),
+                    ("max_child", vl5_recno),
+                    ("n_keys", c.c_uint32),
+                    ("children", vl5_namehtree_node_entry * n_keys)]
+    return vl5_namehtree_node_s
+
+def vl5_namehtree_collision_entry(name_len):
+    class vl5_namehtree_collision_entry_s(BigEndianStruct):
+        _pack_ = 4
+        _fields_ = [("vlentry", vl5_recno),
+                    ("namelen", c.c_uint32),
+                    ("name", c.c_char * name_len)]
+    return vl5_namehtree_collision_entry_s
+
+class vl5_namehtree_collision(BigEndianStruct):
+    _fields_ = [("parent", vl5_recno),
+                ("n_entries", c.c_uint32),
+                # followed by an array of vl5_namehtree_collision_entry values, 'n_entries' long.
+               ]
+
+# 'value' points to either a volume record, or a collision record.
+class vl5_namehtree_leaf_entry(BigEndianStruct):
+    _fields_ = [("hashval", c.c_uint32),
+                ("value", vl5_recno)]
+
+def vl5_namehtree_leaf(n_keys):
+    class vl5_namehtree_leaf_s(BigEndianStruct):
+        _fields_ = [("parent", vl5_recno),
+                    ("n_keys", c.c_uint32),
+                    ("children", vl5_namehtree_leaf_entry * n_keys)]
+    return vl5_namehtree_leaf_s
+
+# Higher-level
+
+class VL5_Record:
+    def __init__(self, tag, recno):
+        self.tag = tag
+        self.recno = recno
+        self.vals = []
+
+    def add_val(self, val):
+        self.vals.append(val)
+
+    def to_bytes(self):
+        bufs = []
+
+        rechdr = vl5_recheader(tag=self.tag)
+        bufs.append(rechdr.to_bytes())
+
+        for val in self.vals:
+            bufs.append(val.to_bytes())
+
+        return b''.join(bufs)
+
+class VL5_Value:
+    def __init__(self, tag):
+        self.tag = tag
+
+    def to_bytes(self):
+        payload = self.payload
+        valhdr = vl5_valheader(tag=self.tag, length=len(payload))
+        try:
+            return valhdr.to_bytes() + payload
+        except:
+            print("val: %r, valhdr: %r, payload: %r" % (self, valhdr.to_bytes(), payload))
+            raise
+
+class VL5_Value_buf(VL5_Value):
+    def __init__(self, tag, payload):
+        super().__init__(tag)
+        self.payload = payload
+
+class VL5_Value_bytestr(VL5_Value_buf):
+    def __init__(self, tag, bytestr):
+        n_chars = len(bytestr)
+        bytestr_type = vl5_bytestr(n_chars)
+
+        buf = bytestr_type(len=len(bytestr), bytestr=bytestr).to_bytes()
+        super().__init__(tag, buf)
+
+class VL5_Value_u32(VL5_Value):
+    def __init__(self, tag, u32):
+        super().__init__(tag)
+        self.u32 = u32
+
+    @property
+    def payload(self):
+        return bytes(c_uint32_be(self.u32))
+
+class VL5_Value_u64(VL5_Value):
+    def __init__(self, tag, u64):
+        super().__init__(tag)
+        self.u64 = u64
+
+    @property
+    def payload(self):
+        return bytes(c_uint64_be(self.u64))
+
+class VL5_Value_Recno(VL5_Value_u64): pass
+class VL5_Value_Volid(VL5_Value_u64): pass
+
+class VL5_Value_FunInfo(VL5_Value_buf):
+    def __init__(self, tag, endian, recsize_log2):
+        finfo = vl5_funinfo(endian=endian, recsize_log2=recsize_log2)
+        super().__init__(tag, finfo.to_bytes())
+
+class VL5_Value_UUID(VL5_Value_buf):
+    def __init__(self, tag, uuid: uuid.UUID):
+        super().__init__(tag, uuid.bytes)
+
+class VL5_Value_IPv4List(VL5_Value):
+    def __init__(self, tag, addrs: t.Iterable[ipaddress.IPv4Address]):
+        super().__init__(tag)
+        self.addrs = addrs
+
+    @property
+    def payload(self):
+        n_items = len(self.addrs)
+
+        v4list_type = vl5_ipv4list(n_items)
+        val_type = c_uint32_be * n_items
+
+        val_list = [int(addr) for addr in self.addrs]
+        v4list = v4list_type(len=n_items, val=val_type(*val_list))
+
+        return v4list.to_bytes()
+
+class VL5_Value_Fileserver_Rec_List(VL5_Value):
+    def __init__(self, tag):
+        super().__init__(tag)
+        self.fslist = []
+
+    def add_fs_rec(self, fsid: int, rec: VL5_Record):
+        self.fslist.append(vl5_fs_reclist_item(fsid=fsid, recno=rec.recno))
+
+    @property
+    def payload(self):
+        n_items = len(self.fslist)
+
+        reclist_type = vl5_fs_reclist(n_items)
+        val_type = vl5_fs_reclist_item * n_items
+
+        fs_reclist = reclist_type(len=n_items, val=val_type(*self.fslist))
+
+        return fs_reclist.to_bytes()
+
+class VL5_Value_VolSiteList(VL5_Value):
+    def __init__(self, tag, sites):
+        super().__init__(tag)
+        self.sites = sites
+
+    @property
+    def payload(self):
+        n_items = len(self.sites)
+
+        sitelist_type = vl5_vol_sitelist(n_items)
+        val_type = vl5_vol_site * n_items
+
+        sitelist = sitelist_type(len=n_items, val=val_type(*self.sites))
+        return sitelist.to_bytes()
+
+class VL5_Value_Partlist(VL5_Value):
+    def __init__(self, tag, partlist):
+        super().__init__(tag)
+        self.partlist = partlist
+
+    @property
+    def payload(self):
+        n_items = len(self.partlist)
+
+        partlist_type = vl5_partlist(n_items)
+        val_type = vl5_partlist_item * n_items
+
+        partlist = partlist_type(len=n_items, val=val_type(*self.partlist))
+        return partlist.to_bytes()
+
+class VL5_Value_IdTree_Node(VL5_Value):
+    def __init__(self, tag, parent, children, max_child):
+        super().__init__(tag)
+        self.parent = parent
+        self.children = children
+        self.max_child = max_child
+
+    @property
+    def payload(self):
+        n_keys = len(self.children)
+
+        node_type = vl5_idtree_node(n_keys)
+        val_type = vl5_idtree_node_entry * n_keys
+
+        children = []
+        for entry in self.children:
+            child = vl5_idtree_node_entry(max_volid=entry.volid, child=entry.rec.recno)
+            children.append(child)
+
+        parent_recno = 0
+        if self.parent is not None:
+            parent_recno = self.parent.recno
+
+        node = node_type(parent=parent_recno, max_child=self.max_child.recno,
+                         n_keys=n_keys, children=val_type(*children))
+        return node.to_bytes()
+
+class VL5_Value_IdTree_Leaf(VL5_Value):
+    def __init__(self, tag, parent, children):
+        super().__init__(tag)
+        self.parent = parent
+        self.children = children
+
+    @property
+    def payload(self):
+        n_items = len(self.children)
+
+        leaf_type = vl5_idtree_leaf(n_items)
+        val_type = vl5_idtree_leaf_entry * n_items
+
+        children = []
+        for entry in self.children:
+            children.append(vl5_idtree_leaf_entry(volid=entry.volid, vlentry=entry.rec.recno))
+
+        parent_recno = 0
+        if self.parent is not None:
+            parent_recno = self.parent.recno
+
+        leaf = leaf_type(parent=parent_recno, n_keys=n_items, children=val_type(*children))
+        return leaf.to_bytes()
+
+class VL5_Value_NameHTree_RootInfo(VL5_Value_buf):
+    def __init__(self, tag, hashfunc):
+        buf = vl5_namehtree_rootinfo(hashfunc=hashfunc).to_bytes()
+        super().__init__(tag, buf)
+
+class VL5_Value_NameHTree_Node(VL5_Value):
+    def __init__(self, tag, parent, children, max_child):
+        super().__init__(tag)
+        self.parent = parent
+        self.children = children
+        self.max_child = max_child
+
+    @property
+    def payload(self):
+        n_keys = len(self.children)
+
+        node_type = vl5_namehtree_node(n_keys)
+        val_type = vl5_namehtree_node_entry * n_keys
+
+        children = []
+        for entry in self.children:
+            children.append(vl5_namehtree_node_entry(max_hash=entry.hashval, child=entry.rec.recno))
+
+        parent_recno = 0
+        if self.parent is not None:
+            parent_recno = self.parent.recno
+
+        node = node_type(parent=parent_recno, max_child=self.max_child.recno,
+                         n_keys=n_keys, val=val_type(*children))
+        return node.to_bytes()
+
+class VL5_Value_NameHTree_Leaf(VL5_Value):
+    def __init__(self, tag, parent, children):
+        super().__init__(tag)
+        self.parent = parent
+        self.children = children
+
+    @property
+    def payload(self):
+        n_items = len(self.children)
+
+        leaf_type = vl5_namehtree_leaf(n_items)
+        val_type = vl5_namehtree_leaf_entry * n_items
+
+        children = []
+        for entry in self.children:
+            children.append(vl5_namehtree_leaf_entry(hashval=entry.hashval, value=entry.rec.recno))
+
+        parent_recno = 0
+        if self.parent is not None:
+            parent_recno = self.parent.recno
+
+        leaf = leaf_type(parent=parent_recno, n_keys=n_items, children=val_type(*children))
+        return leaf.to_bytes()
+
+class VL5_Value_NameHTree_Collision(VL5_Value):
+    def __init__(self, tag, parent, collisions):
+        super().__init__(tag)
+        self.parent = parent
+        self.collisions = collisions
+
+    @property
+    def payload(self):
+        n_items = len(self.collisions)
+
+        header = vl5_namehtree_collision(parent=self.parent.recno, n_entries=n_items)
+        bufs = [header.to_bytes()]
+
+        for coll in self.collisions:
+            name = coll.keystr
+            namelen = len(name)
+            coll_type = vl5_namehtree_collision_entry(namelen)
+            entry = coll_type(vlentry=coll.rec.recno, namelen=namelen, name=name)
+
+            bufs.append(entry.to_bytes())
+
+        return b''.join(bufs)
+
+class VL5_BTree_Slot:
+    key = None
+    keystr = None
+    # If we're a leaf slot, this points to the final value (the volume entry
+    # record, or collision record, etc).
+    rec = None
+    # If we're a non-leaf slot, this points to the child node.
+    node = None
+    collisions = None
+
+class VL5_VolidTree_Slot:
+    volid = None
+    rec = None
+
+class VL5_VolnameHTree_Slot:
+    hashval = None
+    name = None
+    rec = None
+
+class VL5_BTree_Node:
+    duplicate_ok = NotImplementedError
+    rec = None
+
+    def __init__(self, parent, dumper=None):
+        if dumper is None:
+            dumper = parent.dumper
+        self.dumper = dumper
+        self.parent = parent
+        self.slots = []
+        self.max_child = None
+        self.leaf = True
+
+    def insert_volint(self, key: int, volrec: VL5_Record, keystr=None):
+        (idx, node) = self.find_slot(key, duplicate_ok=self.duplicate_ok)
+        if not self.leaf:
+            node.insert_volint(key, volrec)
+            return
+
+        newslot = VL5_BTree_Slot()
+        newslot.key = key
+        newslot.keystr = keystr
+        newslot.rec = volrec
+
+        if idx is not None and self.slots[idx].key == key:
+            # We're inserting key 'key', but a slot already exists with that
+            # key.
+            self.insert_dup(self.slots[idx], newslot)
+            return
+
+        if idx is not None:
+            self.slots.insert(idx, newslot)
+        else:
+            self.slots.append(newslot)
+
+        self.maybe_split()
+
+    def find_slot(self, key: int, duplicate_ok=False):
+        ins_idx = None
+        for (idx, slot) in enumerate(self.slots):
+            if key == slot.key and not duplicate_ok:
+                raise VL5_DuplicateKeyError("key already in node: %d" % key)
+            if key <= slot.key:
+                return (idx, slot.node)
+
+        return (None, self.max_child)
+
+    def maybe_split(self):
+        if self.need_split():
+            self.split()
+
+    def need_split(self):
+        rec = self.fake_record()
+        if len(rec.to_bytes()) > self.dumper.recsize:
+            return True
+        return False
+
+    def split(self):
+        n_slots = len(self.slots)
+        n_left = math.ceil(n_slots / 2)
+
+        # Pick a 'pivot'; all the children left of the pivot go in the new left
+        # node. All of the children to the right of the pivot go in the new
+        # right node. If we are a leaf, the pivot itself also goes in the new
+        # left node; if we are a non-leaf, the pivot is not included in either
+        # new node (instead it just gets inserted into the parent).
+        pivot = self.slots[n_left-1]
+        if self.leaf:
+            left_slots = self.slots[:n_left]
+        else:
+            left_slots = self.slots[:n_left-1]
+        right_slots = self.slots[n_left:]
+        self.slots = []
+
+        parent = self.parent
+        if parent is None:
+            # We are the root node. To split this node, we effectively create a
+            # new root node. But we actually reuse 'self' as the new root node,
+            # and move all of the child slots into two new nodes.
+            parent = self
+
+        left = type(self)(parent)
+        left.slots = left_slots
+        left.leaf = self.leaf
+        if not self.leaf:
+            left.max_child = pivot.node
+        left.reset_parents()
+
+        right = type(self)(parent)
+        right.slots = right_slots
+        right.leaf = self.leaf
+        right.max_child = self.max_child
+        right.reset_parents()
+
+        if self is parent:
+            # New root
+            self.max_child = right
+            self.leaf = False
+            self.insert_node(pivot, left)
+        else:
+            parent.replace_node(self, right)
+            parent.insert_node(pivot, left)
+            parent.maybe_split()
+
+    def replace_node(self, old, new):
+        for (idx, slot) in enumerate(self.slots):
+            if slot.node is old:
+                self.slots[idx].node = new
+                return
+        if self.max_child is old:
+            self.max_child = new
+            return
+        raise InternalError("replace_node cannot find old node %r" % old)
+
+    def insert_node(self, keyslot, node):
+        (idx, _) = self.find_slot(keyslot.key)
+
+        newslot = VL5_BTree_Slot()
+        newslot.key = keyslot.key
+        newslot.keystr = keyslot.keystr
+        newslot.node = node
+
+        if idx is not None:
+            self.slots.insert(idx, newslot)
+        else:
+            self.slots.append(newslot)
+
+        self.maybe_split()
+
+    def reset_parents(self):
+        for slot in self.slots:
+            if slot.node is not None:
+                slot.node.parent = self
+        if self.max_child is not None:
+            self.max_child.parent = self
+
+    def pretty_dict(self):
+        ret = {
+            "leaf": self.leaf,
+            "parent": repr(self.parent),
+        }
+        for slot in self.slots:
+            if slot.rec is not None:
+                val = slot.rec
+            else:
+                val = slot.node.pretty_dict()
+            ret["slot_%d" % slot.key] = val
+        if self.max_child is not None:
+            ret["max_child"] = self.max_child.pretty_dict()
+        return ret
+
+    def pretty(self):
+        return pprint.pformat(self.pretty_dict())
+
+    
+class VL5_VolidTree_Node(VL5_BTree_Node):
+    duplicate_ok = False
+
+    # Generate a record, but with fake record numbers etc. We don't want to
+    # generate record numbers yet, since we're not actually dumping any data
+    # yet; the records and such may still move around.
+    def fake_record(self):
+        rec = VL5_Record(VL5_TAG_VOL_IDTREE_REC, 0)
+
+        fakeslots = []
+        for slot in self.slots:
+            fslot = VL5_VolidTree_Slot()
+            fslot.volid = slot.key
+            fslot.rec = rec
+            fakeslots.append(fslot)
+
+        if self.leaf:
+            val = VL5_Value_IdTree_Leaf(VL5_TAG_VOL_IDTREE_LEAF, parent=None, children=fakeslots)
+        else:
+            val = VL5_Value_IdTree_Node(VL5_TAG_VOL_IDTREE_NODE, parent=None, children=fakeslots, max_child=rec)
+        rec.add_val(val)
+        return rec
+
+    def emit_node(self):
+        if self.rec is not None:
+            return
+        self.rec = self.dumper.alloc_record(VL5_TAG_VOL_IDTREE_REC)
+        rec = self.rec
+
+        idslots = []
+        for slot in self.slots:
+            idslot = VL5_VolidTree_Slot()
+            idslot.volid = slot.key
+
+            if slot.rec is not None:
+                idslot.rec = slot.rec
+            else:
+                slot.node.emit_node()
+                idslot.rec = slot.node.rec
+
+            idslots.append(idslot)
+
+        parent_rec = None
+        if self.parent is not None:
+            parent_rec = self.parent.rec
+
+        if self.leaf:
+            val = VL5_Value_IdTree_Leaf(VL5_TAG_VOL_IDTREE_LEAF, parent=parent_rec, children=idslots)
+        else:
+            self.max_child.emit_node()
+            val = VL5_Value_IdTree_Node(VL5_TAG_VOL_IDTREE_NODE, parent=parent_rec, children=idslots, max_child=self.max_child.rec)
+        rec.add_val(val)
+        self.dumper.emit_record(rec)
+
+    def insert_volid(self, volid, volrec):
+        self.insert_volint(volid, volrec)
+
+crc32c = crcmod.predefined.mkCrcFun('crc-32c')
+class VL5_VolnameHTree_Node(VL5_BTree_Node):
+    duplicate_ok = True
+
+    def fake_record(self):
+        rec = VL5_Record(VL5_TAG_VOL_NAMEHTREE_REC, 0)
+
+        fakeslots = []
+        for slot in self.slots:
+            fslot = VL5_VolnameHTree_Slot()
+            fslot.hashval = slot.key
+            fslot.name = slot.keystr
+            fslot.rec = rec
+            fslot.node = slot.node
+            fakeslots.append(fslot)
+
+        if self.leaf:
+            val = VL5_Value_NameHTree_Leaf(VL5_TAG_VOL_NAMEHTREE_LEAF, parent=None, children=fakeslots)
+        else:
+            val = VL5_Value_NameHTree_Node(VL5_TAG_VOL_NAMEHTREE_NODE, parent=None, children=fakeslots, max_child=rec)
+        rec.add_val(val)
+        return rec
+
+    def emit_node(self):
+        if self.rec is not None:
+            return
+
+        self.rec = self.dumper.alloc_record(VL5_TAG_VOL_NAMEHTREE_REC)
+        rec = self.rec
+
+        if self.parent is None:
+            val = VL5_Value_NameHTree_RootInfo(VL5_TAG_VOL_NAMEHTREE_ROOTINFO,
+                                               hashfunc=VL5_NAMEHTREE_HASHFUNC_CRC32C)
+            rec.add_val(val)
+
+        nameslots = []
+        for slot in self.slots:
+            nslot = VL5_VolnameHTree_Slot()
+            nslot.hashval = slot.key
+            nslot.name = slot.keystr
+
+            if slot.rec is not None:
+                nslot.rec = slot.rec
+            elif slot.node is not None:
+                slot.node.emit_node()
+                nslot.rec = slot.node.rec
+            else:
+                coll_rec = self.dumper.alloc_record(VL5_TAG_VOL_NAMEHTREE_COLL_REC)
+                coll_val = VL5_Value_NameHTree_Collision(VL5_TAG_VOL_NAMEHTREE_COLL_VAL, rec, node.collisions)
+                coll_rec.add_val(coll_val)
+                nslot.rec = coll_rec
+
+            nameslots.append(nslot)
+
+        parent_rec = None
+        if self.parent is not None:
+            parent_rec = self.parent.rec
+
+        if self.leaf:
+            val = VL5_Value_NameHTree_Leaf(VL5_TAG_VOL_NAMEHTREE_LEAF, parent=parent_rec, children=nameslots)
+        else:
+            self.max_child.emit_node()
+            val = VL5_Value_NameHTree_Node(VL5_TAG_VOL_NAMEHTREE_NODE, parent=parent_rec, children=nameslots, max_child=self.max_child.rec)
+        rec.add_val(val)
+        self.dumper.emit_record(rec)
+
+    def insert_volname(self, volname, volrec):
+        hashval = crc32c(volname)
+        self.insert_volint(hashval, volrec, keystr=volname)
+
+    def insert_dup(self, oldslot, newslot):
+        if oldslot.collisions is None:
+            slot = VL5_BTree_Slot()
+            slot.key = oldslot.key
+            slot.keystr = oldslot.keystr
+            slot.rec = oldslot.rec
+
+            oldslot.collisions = [slot]
+            oldslot.keystr = None
+            oldslot.rec = None
+
+        # Insert 'newslot' into the list of collisions, keeping the list
+        # sorted.
+        for (idx, slot) in enumerate(oldslot.collisions):
+            if slot.keystr == newslot.keystr:
+                raise VL5_DuplicateKeyError("key str already exists: %s" % slot.keystr)
+            if newslot.keystr < slot.keystr:
+                oldslot.collisions.insert(idx, newslot)
+                return
+
+        oldslot.collisions.append(newslot)
 
 # Format-agnostic data
 
 class VL_GlobalInfo:
-    max_volid = None
+    next_volid = None
 
-class VL_Server:
+class VL_Fileserver:
     uuid = None
     addrs = None
 
@@ -217,6 +1365,7 @@ class VL_Volume:
     id = None
     sites = None
     locked = False
+    bkexists = False
 
 class VL_VolumeSite:
     server = None
@@ -253,7 +1402,7 @@ class FileFormat:
 
     @classmethod
     def choices(cls):
-        return cls.formats.keys()
+        return cls.formats.values()
 
 ### VLDB file formats (loading)
 
@@ -347,11 +1496,11 @@ class VLDB4UbikLoader(FileLoader):
         print("vlheader: %s" % vlheader)
 
         ginfo = VL_GlobalInfo()
-        ginfo.max_volid = vlheader.MaxVolumeId
+        ginfo.next_volid = vlheader.MaxVolumeId
         return ginfo
 
     def serverno_to_server(self, serverno):
-            srv = VL_Server()
+            srv = VL_Fileserver()
             mhentry = self.serverno_to_mh(serverno)
             if mhentry is not None:
                 # Server IP representing an MH entry
@@ -407,6 +1556,7 @@ class VLDB4UbikLoader(FileLoader):
 
             yield self.vlentry_to_vol(entry)
             addr += c.sizeof(vl4_nvlentry)
+        print()
 
     def enumerate_sites(self, vlentry):
         for serverid, partno, sflags in zip(vlentry.serverNumber,
@@ -418,7 +1568,7 @@ class VLDB4UbikLoader(FileLoader):
 
     def vlentry_to_vol(self, vlentry):
         vol = VL_Volume()
-        vol.name = vlentry.name.decode('utf-8')
+        vol.name = vlentry.name
         vol.id = {}
         if vlentry.volumeId[0] != 0:
             vol.id['readwrite'] = vlentry.volumeId[0]
@@ -428,11 +1578,13 @@ class VLDB4UbikLoader(FileLoader):
             vol.id['backup'] = vlentry.volumeId[2]
         if vlentry.cloneId != 0:
             vol.id['clone'] = vlentry.cloneId
+        if vlentry.flags & VL4_VLF_BACKEXISTS != 0:
+            vol.bkexists = True
 
         for lockbit, descr in [(VL4_VLOP_MOVE,    "move"),
                                (VL4_VLOP_RELEASE, "release"),
                                (VL4_VLOP_BACKUP,  "backup"),
-                               (VL4_VLOP_DELETE,  "misc"),
+                               (VL4_VLOP_DELETE,  "delete"),
                                (VL4_VLOP_DUMP,    "dump"),
                               ]:
             if vlentry.flags & lockbit != 0:
@@ -491,8 +1643,6 @@ class FileDumper(FileFormat):
 class YamlDumper(FileDumper):
     format_name = 'yaml'
 
-    dumper = None
-
     def dump_all(self, loader):
         ydumper = yaml.SafeDumper(self.outfh, encoding='utf-8')
         self.ydumper = ydumper
@@ -503,7 +1653,7 @@ class YamlDumper(FileDumper):
 
         ginfo = loader.get_globalinfo()
         self.emit_dict_items({
-            "max_volid": ginfo.max_volid,
+            "next_volid": ginfo.next_volid,
         })
 
         servers = []
@@ -536,6 +1686,9 @@ class YamlDumper(FileDumper):
         if vol.locked:
             info['locked'] = vol.locked
 
+        if vol.bkexists:
+            info['bkexists'] = True
+
         info['sites'] = []
         for site in vol.sites:
             siteinfo = {
@@ -565,6 +1718,229 @@ class YamlDumper(FileDumper):
         node = self.ydumper.represent_data(val)
         self.ydumper.anchor_node(node)
         self.ydumper.serialize_node(node, None, None)
+
+@FileDumper.def_format
+class VLDB5UbikDumper(FileDumper):
+    format_name = 'vldb5.ubik'
+
+    foo_counter = 1
+
+    # 1k records
+    recsize_log2 = 8
+    recsize = 256
+
+    next_fsid = 1
+    next_partid = 1
+
+    def dump_all(self, loader):
+        self.db0 = UbikFile(self.outfh)
+        db0 = self.db0
+
+        db0.write_header(int(time.time()), 1)
+
+        self.records = {}
+        self.fs_list = []
+        self.fs_uuidmap = {}
+        self.fs_addrmap = {}
+        self.partmap = {}
+        self.volid_root = VL5_VolidTree_Node(parent=None, dumper=self)
+        self.volname_root = VL5_VolnameHTree_Node(parent=None, dumper=self)
+
+        eof_val = VL5_Value_Recno(VL5_TAG_EOF, 0)
+        self.eof_val = eof_val
+
+        root = self.alloc_record(VL5_TAG_ROOT_BE)
+        root.add_val(VL5_Value_FunInfo(VL5_TAG_FUNINFO_BE, endian=VL5_ENDIAN_BIG,
+                                       recsize_log2=self.recsize_log2))
+
+        root.add_val(eof_val)
+
+        root.add_val(VL5_Value_Recno(VL5_TAG_FREE_PTR, 0))
+
+        ginfo = loader.get_globalinfo()
+        root.add_val(VL5_Value_Volid(VL5_TAG_NEXT_VOLID, ginfo.next_volid))
+
+        fs_reclist_val = VL5_Value_Fileserver_Rec_List(VL5_TAG_FS_RECNO_LIST)
+
+        for srv in loader.get_servers():
+            srec = self.alloc_record(VL5_TAG_FILESERVER)
+
+            if srv.uuid is not None:
+                srec.add_val(VL5_Value_UUID(VL5_TAG_FS_UUID, srv.uuid))
+            srec.add_val(VL5_Value_IPv4List(VL5_TAG_FS_IPV4LIST, srv.addrs))
+
+            fsid = self.add_fs(srv, srec)
+            fs_reclist_val.add_fs_rec(fsid, srec)
+
+        slist_rec = self.alloc_record(VL5_TAG_FILESERVER_LIST_REC)
+        slist_rec.add_val(fs_reclist_val)
+
+        root.add_val(VL5_Value_Recno(VL5_TAG_FILESERVER_LIST_PTR, slist_rec.recno))
+
+        partlist_rec = self.alloc_record(VL5_TAG_PARTITION_LIST_REC)
+        root.add_val(VL5_Value_Recno(VL5_TAG_PARTITION_LIST_PTR, partlist_rec.recno))
+
+        self.emit_records()
+
+        for vol in loader.get_volumes():
+            self.emit_volume(vol)
+
+        partlist_val = self.get_partlist_val()
+        partlist_rec.add_val(partlist_val)
+        self.emit_record(partlist_rec)
+
+        self.volid_root.emit_node()
+        root.add_val(VL5_Value_Recno(VL5_TAG_VOL_IDTREE_PTR, self.volid_root.rec.recno))
+
+        self.volname_root.emit_node()
+        root.add_val(VL5_Value_Recno(VL5_TAG_VOL_NAMEHTREE_PTR, self.volname_root.rec.recno))
+
+        self.emit_record(root)
+
+    def get_partlist_val(self):
+        # Sort our partitions by partid
+        items = sorted(self.partmap.items(), key=operator.itemgetter(1))
+
+        partlist = []
+        for ((fsid, partnum), partid) in items:
+            partlist.append((partid, fsid, partnum))
+
+        return VL5_Value_Partlist(VL5_TAG_PARTITION_LIST_VAL, partlist)
+
+    def emit_volume(self, vol):
+        volrec = self.alloc_record(VL5_TAG_VOLUME)
+        volrec.add_val(VL5_Value_bytestr(VL5_TAG_VOL_NAME, vol.name))
+
+        binfo = vl5_vol_basicinfo()
+        binfo.rwid = vol.id.get('readwrite', 0)
+        binfo.roid = vol.id.get('readonly', 0)
+        binfo.bkid = vol.id.get('backup', 0)
+        if vol.bkexists:
+            binfo.vlf_backexists = 1
+        volrec.add_val(VL5_Value_buf(VL5_TAG_VOL_BASIC_INFO, binfo.to_bytes()))
+
+        clid = vol.id.get('clone', None)
+        if clid is not None:
+            volrec.add_val(VL5_Value_Volid(VL5_TAG_VOL_CLONEID, clid))
+
+        if vol.locked:
+            lockinfo = vl5_vol_lockinfo()
+
+            # default to 'delete' as the lock type as a fallback
+            lockinfo.locktype = {
+                "move":    VL5_LOCK_MOVE,
+                "release": VL5_LOCK_RELEASE,
+                "backup":  VL5_LOCK_BACKUP,
+                "delete":  VL5_LOCK_DELETE,
+                "dump":    VL5_LOCK_DUMP
+            }.get(vol.locked, VL5_LOCK_UNKNOWN)
+
+            volrec.add_val(VL5_Value_buf(VL5_TAG_VOL_LOCKINFO, lockinfo.to_bytes()))
+
+        mixed = False
+        for site in vol.sites:
+            if site.old:
+                mixed = True
+                break
+        
+        sitelist = []
+        for site in vol.sites:
+            vl5site = vl5_vol_site()
+            if site.type == 'readwrite':
+                vl5site.type = VL5_SITE_RW
+            elif site.type == 'readonly':
+                vl5site.type = VL5_SITE_RO
+            else:
+                raise UnsupportedError("Unsupported volume site type %s" % site.type)
+
+            if site.notreleased:
+                vl5site.flags |= VL5_VLSF_DONTUSE
+            if mixed and not site.old:
+                vl5site.flags |= VL5_VLSF_NEWREPSITE
+
+            vl5site.partid = self.get_partid(site.server, site.partition)
+
+            sitelist.append(vl5site)
+
+        volrec.add_val(VL5_Value_VolSiteList(VL5_TAG_VOL_SITELIST, sitelist))
+
+        self.emit_record(volrec)
+
+        for volid in (binfo.rwid, binfo.roid, binfo.bkid, clid):
+            if volid not in [None, 0]:
+                self.volid_root.insert_volid(volid, volrec)
+                #print("volid root: %s" % self.volid_root.pretty())
+        self.volname_root.insert_volname(vol.name, volrec)
+        #print("volname root: %s" % self.volname_root.pretty())
+
+    def add_fs(self, srv: VL_Fileserver, rec: VL5_Record):
+        fsid = self.next_fsid
+        self.next_fsid += 1
+        self.fs_list.append({'fsid': fsid, 'fs': srv, 'rec': rec})
+        if srv.uuid is not None:
+            if srv.uuid in self.fs_uuidmap:
+                raise InternalError()
+            self.fs_uuidmap[srv.uuid] = fsid
+
+        if srv.addrs[0] in self.fs_addrmap:
+            raise InternalError()
+        self.fs_addrmap[srv.addrs[0]] = fsid
+
+        return fsid
+
+    def find_fsid(self, srv: VL_Fileserver):
+        if srv.uuid is not None:
+            if srv.uuid not in self.fs_uuidmap:
+                raise InternalError()
+            return self.fs_uuidmap[srv.uuid]
+
+        if srv.addrs[0] not in self.fs_addrmap:
+            raise InternalError()
+        return self.fs_addrmap[srv.addrs[0]]
+            
+
+    def get_partid(self, srv: VL_Fileserver, part: VL_Partition):
+        fsid = self.find_fsid(srv)
+
+        key = (fsid, part.num)
+        partid = self.partmap.get(key, None)
+        if partid is None:
+            partid = self.next_partid
+            self.next_partid += 1
+            self.partmap[key] = partid
+        return partid
+
+    def emit_records(self):
+        for rec in list(self.records.values()):
+            self.emit_record(rec)
+
+    def emit_record(self, record):
+        buf = record.to_bytes()
+        if len(buf) > self.recsize:
+            raise InternalError("record %r is too big (%d > %d)" % (record,
+                                len(buf), self.recsize))
+
+        # Pad the end of the record with NULs to make it exactly 'recsize'
+        # bytes long.
+        padlen = self.recsize - len(buf)
+        buf += b'\0' * padlen
+
+        if len(buf) != self.recsize:
+            raise InternalError("padded record %r is wrong size (%d != %d)" %
+                                (record, len(buf), self.recsize))
+
+        self.db0.seek(record.recno * self.recsize)
+        self.db0.write(buf)
+
+        self.records.pop(record.recno, None)
+
+    def alloc_record(self, tag):
+        # Get a record at EOF, then dump the EOF recno.
+        recno = self.eof_val.u64
+        self.eof_val.u64 += 1
+        rec = VL5_Record(tag, recno)
+        self.records[recno] = rec
+        return rec
 
 ### Option parsing, etc
 
@@ -597,6 +1973,8 @@ def main(argv):
     dumper = args.to_type(args, outfile=args.outfile)
 
     run_convert(args, loader, dumper)
+
+    print("Done converting VLDB from %s to %s." % (args.infile, args.outfile))
 
 if __name__ == '__main__':
     main(sys.argv)
