@@ -191,8 +191,8 @@ class vl4_ex_header(BigEndianStruct):
                 ("spares1",   c.c_int32 * 2),
                 ("flags",     c.c_int32),
 
-                # contaddrs[0] points to a vl4_ex_headerblock (same as SIT).
-                # contaddrs[1..n] each point to a vl4_ex_addrblock.
+                # contaddrs[0] points to the first vl4_ex_block (same as SIT).
+                # contaddrs[1..n] each point to continuation vl4_ex_block's.
                 ("contaddrs", c.c_uint32 * VL4_MAX_ADDREXTBLKS),
                 ("spares2",   c.c_int32 * 24)]
 
@@ -210,16 +210,11 @@ class vl4_ex_addrentry(BigEndianStruct):
 assert_size(vl4_ex_header, 128)
 assert_size(vl4_ex_addrentry, 128)
 
-class vl4_ex_headerblock(BigEndianStruct):
+class vl4_ex_block(BigEndianStruct):
     _fields_ = [("ex_header", vl4_ex_header),
                 ("ex_addrentry", vl4_ex_addrentry * (VL4_MHSRV_PERBLK-1))]
 
-class vl4_ex_addrblock(BigEndianStruct):
-    _fields_ = [("ex_addrentry", vl4_ex_addrentry * VL4_MHSRV_PERBLK)]
-
-# Just double-check the size of our extaddr block structs
-assert_size(vl4_ex_headerblock, VL4_ADDREXTBLK_SIZE)
-assert_size(vl4_ex_addrblock, VL4_ADDREXTBLK_SIZE)
+assert_size(vl4_ex_block, VL4_ADDREXTBLK_SIZE)
 
 class vl4_nvlentry(BigEndianStruct):
     _fields_ = [("volumeId",        c.c_uint32 * VL4_MAXTYPES),
@@ -1624,7 +1619,7 @@ class VLDB4UbikLoader(FileLoader):
             return []
 
         # Load the first extent block
-        block = vl4_ex_headerblock.from_file(self.db0, sit_addr)
+        block = vl4_ex_block.from_file(self.db0, sit_addr)
         header = block.ex_header
         if header.contaddrs[0] != sit_addr:
             raise VL4FormatError("extent header contaddrs[0] != SIT (%d != %d)" %
@@ -1642,8 +1637,8 @@ class VLDB4UbikLoader(FileLoader):
         # Load any extra extent blocks
         for addr in header.contaddrs[1:]:
             if addr != 0:
-                block = vl4_ex_addrblock.from_file(self.db0, addr)
-                ex_addr.append(block.ex_addrentry)
+                block = vl4_ex_block.from_file(self.db0, addr)
+                ex_addr.append([None] + [*block.ex_addrentry])
             else:
                 ex_addr.append([])
 
