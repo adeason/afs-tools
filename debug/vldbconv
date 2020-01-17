@@ -1423,7 +1423,7 @@ class FileFormat:
 
     @classmethod
     def choices(cls):
-        return cls.formats.values()
+        return cls.formats.keys()
 
 ### VLDB file formats (loading)
 
@@ -1574,7 +1574,7 @@ class YamlLoader(FileLoader):
 
 @FileLoader.def_format
 class VLDB4UbikLoader(FileLoader):
-    format_name = 'vldb4.ubik'
+    format_name = 'vldb4'
 
     VL4_HEADERSIZE = 132120
 
@@ -1875,7 +1875,7 @@ class YamlDumper(FileDumper):
 
 @FileDumper.def_format
 class VLDB5UbikDumper(FileDumper):
-    format_name = 'vldb5.ubik'
+    format_name = 'vldb5'
 
     foo_counter = 1
 
@@ -2111,20 +2111,18 @@ def main(argv):
 
     parser.add_argument('outfile', help='output file name')
 
-    parser.add_argument('--from', '-f', default='vldb4.ubik', help='input file format',
+    parser.add_argument('--from', '-f', default='vldb4', help='input file format',
                         dest='from_type',
-                        type=FileLoader.get_format,
                         choices=FileLoader.choices())
 
     parser.add_argument('--to', '-t', default='yaml', help='output format',
                         dest='to_type',
-                        type=FileDumper.get_format,
                         choices=FileDumper.choices())
 
     args = parser.parse_args(argv[1:])
 
-    loader = args.from_type(args, infile=args.infile)
-    dumper = args.to_type(args, outfile=args.outfile)
+    loader = FileLoader.get_format(args.from_type)(args, infile=args.infile)
+    dumper = FileDumper.get_format(args.to_type)(args, outfile=args.outfile)
 
     run_convert(args, loader, dumper)
 
