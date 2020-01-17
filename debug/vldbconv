@@ -114,7 +114,10 @@ class UbikFile:
     def write(self, buf):
         self.fh.write(buf)
 
-    def write_header(self, epoch, counter):
+    def write_header(self, epoch=None, counter=1):
+        if epoch is None:
+            epoch = int(time.time())
+
         hdr = ubik_hdr()
         hdr.magic = ubik_hdr.UBIK_MAGIC
         hdr.size = ubik_hdr.HDRSIZE
@@ -150,10 +153,13 @@ VL4_VLOP_RELEASE =     0x20
 VL4_VLOP_BACKUP =      0x40
 VL4_VLOP_DELETE =      0x90
 VL4_VLOP_DUMP =       0x100
+VL4_VLF_RWEXISTS =   0x1000
+VL4_VLF_ROEXISTS =   0x2000
 VL4_VLF_BACKEXISTS = 0x4000
 
 # vl4_nvlentry.serverFlags flags
 VL4_VLSF_NEWREPSITE = 0x1
+VL4_VLSF_ROVOL =      0x2
 VL4_VLSF_RWVOL =      0x4
 VL4_VLSF_DONTUSE =   0x20
 
@@ -172,11 +178,13 @@ class vl4_vlheader(BigEndianStruct):
     _fields_ = [("vital_header", vl4_vital_vlheader),
                 ("IpMappedAddr", c.c_uint32 * (VL4_MAXSERVERID + 1)),
                 ("VolnameHash",  c.c_uint32 * VL4_HASHSIZE),
-                ("VolidHash",    (c.c_uint32 * VL4_MAXTYPES) * VL4_HASHSIZE),
+                ("VolidHash",    (c.c_uint32 * VL4_HASHSIZE) * VL4_MAXTYPES),
 
-                # Points to a vl4_ex_headerblock
+                # Points to a vl4_ex_block
                 ("SIT",          c.c_int32)]
-assert_size(vl4_vlheader, 132120)
+
+VL4_HEADERSIZE = 132120
+assert_size(vl4_vlheader, VL4_HEADERSIZE)
 
 class vl4_afsuuid(BigEndianStruct):
     _fields_ = [("time_low", c.c_uint32),
@@ -1576,8 +1584,6 @@ class YamlLoader(FileLoader):
 class VLDB4UbikLoader(FileLoader):
     format_name = 'vldb4'
 
-    VL4_HEADERSIZE = 132120
-
     _vlheader = None
     _db0 = None
     _ex_addr = None
@@ -1601,9 +1607,9 @@ class VLDB4UbikLoader(FileLoader):
             raise VL4FormatError("Wrong vldb version: %d != 4" % vers)
 
         headersize = vlheader.vital_header.headersize
-        if headersize != self.VL4_HEADERSIZE:
+        if headersize != VL4_HEADERSIZE:
             raise VL4FormatError("Wrong header size: %d != %d" % (headersize,
-                                 self.VL4_HEADERSIZE))
+                                 VL4_HEADERSIZE))
 
         self._vlheader = vlheader
         return vlheader
@@ -1794,6 +1800,242 @@ class FileDumper(FileFormat):
             self.outfh = open(self.outfile, 'xb')
 
 @FileDumper.def_format
+class VLDB4UbikDumper(FileDumper):
+    format_name = 'vldb4'
+
+    def dump_all(self, loader):
+        self.db0 = UbikFile(self.outfh)
+        db0 = self.db0
+
+        db0.write_header()
+
+        self.ex_addr = None
+        self.fs_map = {}
+        self.next_serverno = 0
+        self.next_mhbase = 0
+        self.next_mhindex = 1
+
+        ginfo = loader.get_globalinfo()
+
+        self.vlheader = vl4_vlheader()
+        vlheader = self.vlheader
+        vlheader.vldbversion = 4
+        vlheader.headersize = c.sizeof(vlheader)
+        vlheader.eofPtr = vlheader.headersize
+        vlheader.MaxVolumeId = ginfo.next_volid
+
+        for srv in loader.get_servers():
+            self.add_fs(srv)
+
+        self.emit_mhblocks()
+
+        for vol in loader.get_volumes():
+            self.emit_vol(vol)
+
+        vlheader.to_file(self.db0, 0)
+
+    def hash_volid(self, addr, volid, idx):
+        hashval = volid % VL4_HASHSIZE
+
+        old_addr = self.vlheader.VolidHash[idx][hashval]
+        self.vlheader.VolidHash[idx][hashval] = addr
+        return old_addr
+
+    def hash_name(self, addr, name):
+        # The C implementation of this is done with 32-bit integers, so all of
+        # our arithmetic is modulo 2^32.
+        limit = 2**32
+
+        hashval = 0
+        for char in reversed(name):
+            hashval = hashval * 63 + (char - 63)
+            hashval %= limit
+        hashval %= VL4_HASHSIZE
+
+        old_addr = self.vlheader.VolnameHash[hashval]
+        self.vlheader.VolnameHash[hashval] = addr
+        return old_addr
+
+    def emit_vol(self, vol: VL_Volume):
+        vlentry = vl4_nvlentry()
+        addr = self.alloc_space(c.sizeof(vlentry))
+
+        vlentry.name = vol.name
+        vlentry.volumeId[0] = vol.id.get('readwrite', 0)
+        vlentry.volumeId[1] = vol.id.get('readonly', 0)
+        vlentry.volumeId[2] = vol.id.get('backup', 0)
+        vlentry.cloneId = vol.id.get('clone', 0)
+
+        for idx, volid in enumerate(vlentry.volumeId):
+            if volid != 0:
+                vlentry.nextIdHash[idx] = self.hash_volid(addr, volid, idx)
+        vlentry.nextNameHash = self.hash_name(addr, vlentry.name)
+
+        if vol.bkexists:
+            vlentry.flags |= VL4_VLF_BACKEXISTS
+
+        if vol.locked:
+            lockmap = {
+                "move":    VL4_VLOP_MOVE,
+                "release": VL4_VLOP_RELEASE,
+                "backup":  VL4_VLOP_BACKUP,
+                "delete":  VL4_VLOP_DELETE,
+                "dump":    VL4_VLOP_DUMP,
+            }
+            lockbit = lockmap.get(vol.locked, VL4_VLOP_DELETE)
+            vlentry.flags |= lockbit
+
+        mixed = False
+        for site in vol.sites:
+            if site.old:
+                mixed = True
+                break
+
+        # Unused site entries need all of their values set to BADSERVERID to
+        # indicate they are unused, so set all of them to that, and we'll set
+        # the valid ones below.
+        for site_idx in range(len(vlentry.serverNumber)):
+            vlentry.serverNumber[site_idx] = VL4_BADSERVERID
+            vlentry.serverPartition[site_idx] = VL4_BADSERVERID
+            vlentry.serverFlags[site_idx] = VL4_BADSERVERID
+
+        for site_idx, site in enumerate(vol.sites):
+            serverNumber = self.serverno_lookup(site.server)
+            serverPartition = site.partition.num
+            serverFlags = 0
+
+            if site.type == 'readwrite':
+                serverFlags |= VL4_VLSF_RWVOL
+                vlentry.flags |= VL4_VLF_RWEXISTS
+
+            elif site.type == 'readonly':
+                serverFlags |= VL4_VLSF_ROVOL
+                vlentry.flags |= VL4_VLF_ROEXISTS
+
+            else:
+                raise InternalError("Unknown site type '%s'" % site.type)
+
+            if site.notreleased:
+                serverFlags |= VL4_VLSF_DONTUSE
+
+            if mixed and not site.old:
+                serverFlags |= VL4_VLSF_NEWREPSITE
+
+            vlentry.serverNumber[site_idx] = serverNumber
+            vlentry.serverPartition[site_idx] = serverPartition
+            vlentry.serverFlags[site_idx] = serverFlags
+
+        vlentry.to_file(self.db0, addr)
+
+    def serverno_lookup(self, srv: VL_Fileserver):
+        if srv.uuid is None:
+            return self.fs_map[int(srv.addrs[0])]
+        return self.fs_map[srv.uuid]
+
+    def emit_mhblocks(self):
+        if self.ex_addr is None:
+            self.vlheader.SIT = 0
+            return
+
+        addrs = self.ex_addr[0].ex_header.contaddrs
+        # Record in the global header where the first mh block is
+        self.vlheader.SIT = addrs[0]
+
+        # Write out the mh blocks
+        for idx, mh in enumerate(self.ex_addr):
+            addr = addrs[idx]
+            if addr != 0:
+                mh.to_file(self.db0, addr)
+
+    def alloc_space(self, size):
+        addr = self.vlheader.eofPtr
+        self.vlheader.eofPtr += size
+        return addr
+
+    def mh_to_fakeip(self, base, index):
+        if base < 0 or base >= VL4_MAX_ADDREXTBLKS:
+            raise InternalError("mh base out of range: %d" % base)
+        if index < 1 or index >= VL4_MHSRV_PERBLK:
+            raise InternalError("mh index out of range: %d" % index)
+
+        fakeip = 0xFF000000
+        fakeip |= (base << 16) & 0xFF0000
+        fakeip |= index & 0xFFFF
+        return fakeip
+
+    def alloc_serverno(self):
+        serverno = self.next_serverno
+        self.next_serverno += 1
+        return serverno
+
+    def alloc_mhentry(self):
+        base = self.next_mhbase
+        index = self.next_mhindex
+
+        self.next_mhindex += 1
+        if self.next_mhindex >= VL4_MHSRV_PERBLK:
+            self.next_mhbase += 1
+            self.next_mhindex = 1
+
+        return (base, index)
+
+    def add_fs(self, srv: VL_Fileserver):
+        serverno = self.alloc_serverno()
+
+        if srv.uuid is None:
+            # If this is a non-uuid fileserver, just use the first IP address
+            # as the IP to record.
+            addr = int(srv.addrs[0])
+            key = addr
+
+        else:
+            # For uuid fileservers, construct a fake IP address using the base
+            # and index of its MH record.
+            base, index = self.alloc_mhentry()
+
+            entry = self.get_mh(base, index)
+            entry.hostuuid = vl4_afsuuid.from_bytes(srv.uuid.bytes)
+            entry.uniquifier = 1
+            for (idx, fsaddr) in enumerate(srv.addrs):
+                entry.addrs[idx] = int(fsaddr)
+
+            addr = self.mh_to_fakeip(base, index)
+            key = srv.uuid
+
+        if key in self.fs_map:
+            raise InternalError()
+        self.fs_map[key] = serverno
+
+        self.vlheader.IpMappedAddr[serverno] = addr
+
+    def get_mh(self, base, index):
+        if self.ex_addr is None:
+            hdr = vl4_ex_block()
+            hdr.ex_header.flags = VL4_CONTBLOCK
+
+            addr = self.alloc_space(c.sizeof(hdr))
+            hdr.ex_header.contaddrs[0] = addr
+
+            self.ex_addr = [hdr, None, None, None]
+
+        if base < 0 or base >= VL4_MAX_ADDREXTBLKS:
+            raise InternalError()
+
+        if index <= 0 or index >= VL4_MHSRV_PERBLK:
+            raise InternalError()
+
+        if self.ex_addr[base] is None:
+            block = vl4_ex_block()
+            block.ex_header.flags = VL4_CONTBLOCK
+
+            addr = self.alloc_block(c.sizeof(block))
+
+            self.ex_addr[0].ex_header.contaddrs[base] = addr
+            self.ex_addr[base] = block
+
+        return self.ex_addr[base].ex_addrentry[index-1]
+
+@FileDumper.def_format
 class YamlDumper(FileDumper):
     format_name = 'yaml'
 
@@ -1890,7 +2132,7 @@ class VLDB5UbikDumper(FileDumper):
         self.db0 = UbikFile(self.outfh)
         db0 = self.db0
 
-        db0.write_header(int(time.time()), 1)
+        db0.write_header()
 
         self.records = {}
         self.fs_list = []
